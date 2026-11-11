@@ -185,14 +185,3 @@ def test_pub_qos0_still_works(broker_port):
     finally:
         sub.close()
         pub.close()
-
-
-def test_pub_qos2_rejected(broker_port):
-    pub = MQTTClient(port=broker_port, client_id="pub")
-    try:
-        pub.connect()
-        pub.publish("t", b"x", qos=2)
-        data = pub.sock.recv(16)
-        assert data == b"", f"expected EOF, got {data.hex()}"
-    finally:
-        pub.close()

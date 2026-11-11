@@ -1,4 +1,7 @@
+#include "config.h"
 #include "mqtt.h"
+#include "persistence.h"
+#include "retained.h"
 #include "subscription.h"
 #include "connection.h"
 
@@ -6,9 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
-
-// QoS1 消息超过这个时间还没收到 PUBACK 就重传（DUP=1）
-#define QOS1_RETRY_TIMEOUT_MS 2000
 
 // 工具：剩余长度变长编码解码
 // 返回: 1 成功, 0 数据不足, -1 非法
@@ -122,8 +122,16 @@ int mqtt_decode_connect(const uint8_t *body, size_t body_len,
         return -1;
     out->clean_session = (connect_flags >> 1) & 0x01;
     out->has_will = (connect_flags >> 2) & 0x01;
+    out->will_qos = (connect_flags >> 3) & 0x03;
+    out->will_retain = (connect_flags >> 5) & 0x01;
     out->has_username = (connect_flags >> 7) & 0x01;
     out->has_password = (connect_flags >> 6) & 0x01;
+
+    // 没有 Will 时 Will QoS / Will Retain 必须为 0
+    if (!out->has_will && (out->will_qos != 0 || out->will_retain != 0))
+        return -1;
+    if (out->will_qos == 3)
+        return -1; // 保留值，非法
 
     // 4. Keep Alive（2 字节，大端）
     if (remain < 2)
@@ -308,6 +316,60 @@ int mqtt_send_publish_qos1(connection_t *c, const char *topic, size_t topic_len,
                                     retain, dup, packet_id);
 }
 
+int mqtt_send_publish_qos2(connection_t *c, const char *topic, size_t topic_len,
+                           const uint8_t *payload, size_t payload_len,
+                           uint8_t retain, uint8_t dup, uint16_t packet_id) {
+    return mqtt_send_publish_packet(c, topic, topic_len, payload, payload_len, 2,
+                                    retain, dup, packet_id);
+}
+
+// QoS2 握手的三种 4 字节确认包：PUBREC / PUBREL / PUBCOMP
+static int send_pid_ack(connection_t *c, uint8_t first_byte,
+                        uint16_t packet_id) {
+    uint8_t pkt[4] = {first_byte, 0x02, (uint8_t)(packet_id >> 8),
+                      (uint8_t)(packet_id & 0xff)};
+    return connection_send(c, pkt, sizeof(pkt));
+}
+
+static int send_pubrec(connection_t *c, uint16_t packet_id) {
+    return send_pid_ack(c, 0x50, packet_id);
+}
+
+static int send_pubrel(connection_t *c, uint16_t packet_id) {
+    return send_pid_ack(c, 0x62, packet_id);
+}
+
+static int send_pubcomp(connection_t *c, uint16_t packet_id) {
+    return send_pid_ack(c, 0x70, packet_id);
+}
+
+// 统一入口：先处理 retained 存储，再向现有订阅者实时转发。
+// 实时转发的 RETAIN 必须为 0；retained 消息只在新订阅时以 RETAIN=1 投递。
+static void broker_publish(const char *topic, size_t topic_len,
+                           const uint8_t *payload, size_t payload_len,
+                           uint8_t qos, uint8_t retain) {
+    if (retain) {
+        if (retained_store(topic, topic_len, payload, payload_len, qos) < 0) {
+            fprintf(stderr, "failed to store retained message for '%.*s'\n",
+                    (int)topic_len, topic);
+        }
+    }
+    subscription_deliver(topic, topic_len, payload, payload_len, qos, 0);
+}
+
+void mqtt_publish_will(connection_t *c) {
+    if (!c || !c->will_topic || c->will_suppress ||
+        c->state != SESSION_STATE_CONNECTED)
+        return;
+
+    printf("fd=%d publish Will topic='%.*s' qos=%u retain=%u\n", c->fd,
+           (int)c->will_topic_len, c->will_topic, c->will_qos,
+           c->will_retain);
+    c->will_suppress = 1; // 防止重复发布
+    broker_publish(c->will_topic, c->will_topic_len, c->will_payload,
+                   c->will_payload_len, c->will_qos, c->will_retain);
+}
+
 // ======== SUBSCRIBE / UNSUBSCRIBE ========
 static int send_suback(connection_t *c, uint16_t packet_id,
                        const uint8_t *codes, size_t n) {
@@ -362,13 +424,22 @@ static void session_flush_queue(session_t *s, connection_t *c) {
         if (!e)
             break;
 
-        if (mqtt_send_publish_qos1(c, q->topic, q->topic_len, q->payload,
-                                   q->payload_len, q->retain, 0,
-                                   packet_id) < 0) {
-            session_inflight_remove(s, packet_id);
-            break;
-        }
+        // 先把“队列 -> inflight”落盘，再从网络发送。
+        // 这样即使崩溃，消息也不会既留在队列又留在 inflight（QoS2 会因此重复）。
         session_queue_pop(s);
+
+        int rc;
+        if (e->qos == 2) {
+            rc = mqtt_send_publish_qos2(c, e->topic, e->topic_len, e->payload,
+                                        e->payload_len, e->retain, 0,
+                                        e->packet_id);
+        } else {
+            rc = mqtt_send_publish_qos1(c, e->topic, e->topic_len, e->payload,
+                                        e->payload_len, e->retain, 0,
+                                        e->packet_id);
+        }
+        if (rc < 0)
+            break; // 发送失败没关系，inflight 已落盘，后续会重传
     }
 }
 
@@ -379,12 +450,27 @@ static void session_resume(session_t *s, connection_t *c) {
         inflight_entry_t *e = &s->inflight[i];
         if (!e->in_use)
             continue;
-        if (mqtt_send_publish_qos1(c, e->topic, e->topic_len, e->payload,
-                                   e->payload_len, e->retain, 1,
-                                   e->packet_id) == 0) {
+
+        if (e->qos == 2 && e->state == INFLIGHT_WAIT_PUBCOMP) {
+            // 已经进入 PUBREL 阶段，重连后重发 PUBREL
+            if (send_pubrel(c, e->packet_id) == 0)
+                e->sent_at_ms = now;
+        } else if (mqtt_send_publish_packet(c, e->topic, e->topic_len,
+                                            e->payload, e->payload_len, e->qos,
+                                            e->retain, 1,
+                                            e->packet_id) == 0) {
+            // QoS1 或 QoS2 的 PUBLISH 阶段：DUP=1 重发
             e->sent_at_ms = now;
         }
     }
+
+    // 入站 QoS2：已经回过 PUBREC 但还没等到 PUBREL 的消息，重连后补发 PUBREC
+    for (int i = 0; i < MAX_INCOMING_QOS2; i++) {
+        incoming_qos2_entry_t *in = &s->incoming_qos2[i];
+        if (in->in_use)
+            send_pubrec(c, in->packet_id);
+    }
+
     session_flush_queue(s, c);
 }
 
@@ -393,6 +479,45 @@ static void connection_mark_dead(connection_t *old) {
     old->dead = 1;
     old->want_close = 1;
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, old->fd, NULL);
+}
+
+// 把 CONNECT 中的 Will 复制到连接；失败返回 -1
+static int connection_store_will(connection_t *c,
+                                 const mqtt_connect_t *mc) {
+    if (!mc->has_will)
+        return 0;
+
+    if (mc->will_qos > 2) {
+        fprintf(stderr, "fd=%d invalid Will QoS %u\n", c->fd, mc->will_qos);
+        return -1;
+    }
+    if (mc->will_topic_len == 0 ||
+        memchr(mc->will_topic, '+', mc->will_topic_len) ||
+        memchr(mc->will_topic, '#', mc->will_topic_len)) {
+        fprintf(stderr, "fd=%d invalid Will topic\n", c->fd);
+        return -1;
+    }
+
+    char *topic = malloc(mc->will_topic_len + 1);
+    uint8_t *payload = malloc(mc->will_payload_len ? mc->will_payload_len : 1);
+    if (!topic || !payload) {
+        free(topic);
+        free(payload);
+        return -1;
+    }
+
+    memcpy(topic, mc->will_topic, mc->will_topic_len);
+    topic[mc->will_topic_len] = '\0';
+    if (mc->will_payload_len)
+        memcpy(payload, mc->will_payload, mc->will_payload_len);
+
+    c->will_topic = topic;
+    c->will_topic_len = mc->will_topic_len;
+    c->will_payload = payload;
+    c->will_payload_len = mc->will_payload_len;
+    c->will_qos = mc->will_qos;
+    c->will_retain = mc->will_retain;
+    return 0;
 }
 
 // 返回: 0 继续, -1 关闭连接
@@ -436,6 +561,10 @@ static int handle_connect(connection_t *c, const uint8_t *body,
         connection_request_close(c);
         return -1;
     }
+
+    if (connection_store_will(c, &mc) < 0)
+        return -1;
+    c->keep_alive = mc.keep_alive;
 
     char client_id[MAX_CLIENT_ID_LEN];
     if (mc.client_id_len == 0) {
@@ -506,35 +635,56 @@ static int handle_publish(connection_t *c, const uint8_t *body, size_t body_len,
     mqtt_publish_t p;
     int rc = mqtt_decode_publish(body, body_len, flags, &p);
     if (rc <= 0) {
-        fprintf(stderr, "fd=%d malformed\n", c->fd);
-        return -1;
-    }
-    if (p.qos > 1) {
-        fprintf(stderr, "fd=%d Qos %u not supported yet\n", c->fd, p.qos);
+        fprintf(stderr, "fd=%d malformed PUBLISH\n", c->fd);
         return -1;
     }
 
-    printf("fd=%d PUBLISH topic='%s' payload=%zu bytes retain=%u\n", c->fd,
-           p.topic, p.payload_len, p.retain);
+    printf("fd=%d PUBLISH topic='%.*s' payload=%zu bytes qos=%u retain=%u\n",
+           c->fd, (int)p.topic_len, p.topic, p.payload_len, p.qos, p.retain);
 
-    // QoS 1：先回 PUBACK（无论有没有订阅者）
+    session_t *sess = c->session;
+    if (!sess)
+        return -1;
+
+    // QoS2 第一阶段：保存消息，回 PUBREC，等 PUBREL 后再投递
+    if (p.qos == 2) {
+        if (session_incoming_qos2_find(sess, p.packet_id)) {
+            // 重复 PUBLISH：消息已在等 PUBREL，只重发 PUBREC
+            printf("fd=%d duplicate QoS2 PUBLISH mid=%u, resend PUBREC\n",
+                   c->fd, p.packet_id);
+            return send_pubrec(c, p.packet_id) < 0 ? -1 : 0;
+        }
+
+        if (!session_incoming_qos2_add(sess, p.packet_id, p.retain, p.topic,
+                                       p.topic_len, p.payload, p.payload_len)) {
+            fprintf(stderr, "fd=%d incoming QoS2 table full\n", c->fd);
+            return -1;
+        }
+
+        if (send_pubrec(c, p.packet_id) < 0)
+            return -1;
+        printf("fd=%d PUBREC sent for mid=%u (wait PUBREL)\n", c->fd,
+               p.packet_id);
+        return 0;
+    }
+
+    // QoS0 或 QoS1：先完成 retained 存储 / 离线入队 / 转发，
+    // 再回 PUBACK，确保客户端收到确认时持久化状态已经落盘。
+    broker_publish(p.topic, p.topic_len, p.payload, p.payload_len, p.qos,
+                   p.retain);
+
     if (p.qos == 1) {
         uint8_t puback[4] = {
             0x40, 0x02,
             (uint8_t)(p.packet_id >> 8),
             (uint8_t)(p.packet_id & 0xFF)
         };
-        if (connection_send(c, puback, sizeof(puback)) < 0) {
+        if (connection_send(c, puback, sizeof(puback)) < 0)
             return -1;
-        }
         printf("fd=%d PUBACK sent for mid=%u\n", c->fd, p.packet_id);
     }
 
-    // 转发（按 min(发布 QoS, 订阅 QoS) 决定投递 QoS）
-    int delivered = subscription_deliver(p.topic, p.topic_len,
-                                         p.payload, p.payload_len,
-                                         p.qos, p.retain);
-    printf("fd=%d PUBLISH delivered to %d subscriber(s)\n", c->fd, delivered);
+    printf("fd=%d PUBLISH handled (retain=%u)\n", c->fd, p.retain);
     return 0;
 }
 
@@ -553,14 +703,112 @@ static int handle_puback(connection_t *c, const uint8_t *body,
     }
 
     session_t *sess = c->session;
-    if (sess && session_inflight_remove(sess, packet_id)) {
+    inflight_entry_t *e =
+        sess ? session_inflight_find(sess, packet_id) : NULL;
+
+    if (e && e->qos == 1) {
+        session_inflight_remove(sess, packet_id);
         printf("fd=%d PUBACK mid=%u, inflight=%d\n", c->fd, packet_id,
                sess->inflight_count);
-        // inflight 腾出空间后，继续发送离线期间排队的消息
+        session_flush_queue(sess, c);
+    } else if (e) {
+        printf("fd=%d PUBACK mid=%u for QoS2 message, ignored\n", c->fd,
+               packet_id);
+    } else {
+        printf("fd=%d PUBACK mid=%u (unknown, ignored)\n", c->fd, packet_id);
+    }
+    return 0;
+}
+
+// ======== handle PUBREC ========
+// 订阅者收到 QoS2 PUBLISH 后的第一阶段确认：broker 回 PUBREL
+static int handle_pubrec(connection_t *c, const uint8_t *body,
+                         size_t body_len) {
+    if (body_len != 2) {
+        fprintf(stderr, "fd=%d invalid PUBREC length %zu\n", c->fd, body_len);
+        return -1;
+    }
+
+    uint16_t packet_id = (uint16_t)((body[0] << 8) | body[1]);
+    if (packet_id == 0)
+        return -1;
+
+    session_t *sess = c->session;
+    inflight_entry_t *e =
+        sess ? session_inflight_find(sess, packet_id) : NULL;
+    if (!e || e->qos != 2) {
+        printf("fd=%d PUBREC mid=%u (unknown, ignored)\n", c->fd, packet_id);
+        return 0;
+    }
+
+    if (e->state != INFLIGHT_WAIT_PUBCOMP) {
+        e->state = INFLIGHT_WAIT_PUBCOMP;
+        e->sent_at_ms = connection_now_ms();
+        persistence_save();
+    }
+    if (send_pubrel(c, packet_id) < 0)
+        return -1;
+
+    printf("fd=%d PUBREL sent for mid=%u\n", c->fd, packet_id);
+    return 0;
+}
+
+// ======== handle PUBREL ========
+// 发布者完成 QoS2 第二阶段：此时才真正投递消息，并回 PUBCOMP
+static int handle_pubrel(connection_t *c, const uint8_t *body,
+                         size_t body_len) {
+    if (body_len != 2) {
+        fprintf(stderr, "fd=%d invalid PUBREL length %zu\n", c->fd, body_len);
+        return -1;
+    }
+
+    uint16_t packet_id = (uint16_t)((body[0] << 8) | body[1]);
+    if (packet_id == 0)
+        return -1;
+
+    session_t *sess = c->session;
+    incoming_qos2_entry_t *in =
+        sess ? session_incoming_qos2_find(sess, packet_id) : NULL;
+
+    if (in) {
+        printf("fd=%d PUBREL mid=%u -> deliver exactly once\n", c->fd,
+               packet_id);
+        broker_publish(in->topic, in->topic_len, in->payload, in->payload_len,
+                       2, in->retain);
+        session_incoming_qos2_remove(sess, packet_id);
+    } else {
+        // 重复 PUBREL 或未知 id：仍然回 PUBCOMP，避免发布者卡住
+        printf("fd=%d PUBREL mid=%u (already completed, ignored)\n", c->fd,
+               packet_id);
+    }
+
+    return send_pubcomp(c, packet_id) < 0 ? -1 : 0;
+}
+
+// ======== handle PUBCOMP ========
+// 订阅者完成 QoS2 第三阶段：清理出站 inflight
+static int handle_pubcomp(connection_t *c, const uint8_t *body,
+                          size_t body_len) {
+    if (body_len != 2) {
+        fprintf(stderr, "fd=%d invalid PUBCOMP length %zu\n", c->fd,
+                body_len);
+        return -1;
+    }
+
+    uint16_t packet_id = (uint16_t)((body[0] << 8) | body[1]);
+    if (packet_id == 0)
+        return -1;
+
+    session_t *sess = c->session;
+    inflight_entry_t *e =
+        sess ? session_inflight_find(sess, packet_id) : NULL;
+    if (e && e->qos == 2 && e->state == INFLIGHT_WAIT_PUBCOMP) {
+        session_inflight_remove(sess, packet_id);
+        printf("fd=%d PUBCOMP mid=%u, inflight=%d\n", c->fd, packet_id,
+               sess->inflight_count);
         session_flush_queue(sess, c);
     } else {
-        // 可能是已经清理过的重复 PUBACK，忽略即可
-        printf("fd=%d PUBACK mid=%u (unknown, ignored)\n", c->fd, packet_id);
+        printf("fd=%d PUBCOMP mid=%u (unknown, ignored)\n", c->fd, packet_id);
     }
     return 0;
 }
@@ -590,8 +838,8 @@ static int handle_disconnect(connection_t *c, const uint8_t *body,
     }
     printf("fd=%d DISCONNECT: client_id='%s' (clean exit)\n", c->fd,
            c->session ? c->session->client_id : "");
-    // TODO(Will): 清除遗嘱消息 —— 但现在还没有 Will 存储，先不管
-    return -1; // 关闭连接
+    c->will_suppress = 1; // 正常断开不发布 Will
+    return -1;            // 关闭连接
 }
 
 // ======== handle SUBSCRIBE =======
@@ -616,7 +864,10 @@ static int handle_subscribe(connection_t *c, const uint8_t *body,
     }
 
     uint8_t codes[64];
+    char granted_filters[64][MAX_FILTER_LEN];
+    uint8_t granted_qos_arr[64];
     size_t n = 0;
+    size_t granted_count = 0;
     while (body_len > 0) {
         if (n >= sizeof(codes)) {
             fprintf(stderr, "fd=%d too many filters in one SUBSCRIBE\n", c->fd);
@@ -648,7 +899,7 @@ static int handle_subscribe(connection_t *c, const uint8_t *body,
         memcpy(filter_buf, filter, filter_len);
         filter_buf[filter_len] = '\0';
 
-        uint8_t granted_qos = req_qos <= 1 ? req_qos : 0; // 只支持 0/1，2暂时降级成0
+        uint8_t granted_qos = req_qos; // 已支持 QoS 0/1/2
         if (subscription_add(c->session, filter_buf, granted_qos) < 0) {
             codes[n++] = MQTT_SUBACK_FAILURE;
             continue;
@@ -657,9 +908,25 @@ static int handle_subscribe(connection_t *c, const uint8_t *body,
         printf("fd=%d SUBSCRIBE '%.*s' (req_qos=%u)\n", c->fd,
                (uint8_t)filter_len, filter, req_qos);
         codes[n++] = granted_qos;
+
+        memcpy(granted_filters[granted_count], filter_buf, filter_len + 1);
+        granted_qos_arr[granted_count] = granted_qos;
+        granted_count++;
     }
 
-    return send_suback(c, packet_id, codes, n);
+    // MQTT 3.1.1：必须先发 SUBACK，再发由新订阅触发的 retained 消息
+    if (send_suback(c, packet_id, codes, n) < 0)
+        return -1;
+
+    for (size_t i = 0; i < granted_count; i++) {
+        int delivered = retained_deliver(c->session, granted_filters[i],
+                                         granted_qos_arr[i]);
+        if (delivered > 0) {
+            printf("fd=%d delivered %d retained message(s) for '%s'\n",
+                   c->fd, delivered, granted_filters[i]);
+        }
+    }
+    return 0;
 }
 
 // ======== handle UNSUBSCRIBE ========
@@ -792,6 +1059,12 @@ static int dispatch_packet(connection_t *c, const mqtt_fixed_header_t *hdr,
         return handle_publish(c, body, body_len, hdr->flags);
     case MQTT_PUBACK:
         return handle_puback(c, body, body_len);
+    case MQTT_PUBREC:
+        return handle_pubrec(c, body, body_len);
+    case MQTT_PUBREL:
+        return handle_pubrel(c, body, body_len);
+    case MQTT_PUBCOMP:
+        return handle_pubcomp(c, body, body_len);
     case MQTT_SUBSCRIBE:
         return handle_subscribe(c, body, body_len, hdr->flags);
     case MQTT_UNSUBSCRIBE:
@@ -815,16 +1088,26 @@ void mqtt_retransmit_all(uint64_t now_ms) {
             inflight_entry_t *e = &s->inflight[i];
             if (!e->in_use)
                 continue;
-            if (now_ms - e->sent_at_ms < QOS1_RETRY_TIMEOUT_MS)
+            if (now_ms - e->sent_at_ms < (uint64_t)g_config.qos_retry_ms)
                 continue;
 
-            // 重传必须带 DUP=1，packet id 保持原值
+            if (e->qos == 2 && e->state == INFLIGHT_WAIT_PUBCOMP) {
+                // 已进入 PUBREL 阶段：重发 PUBREL，而不是 PUBLISH
+                if (send_pubrel(c, e->packet_id) == 0) {
+                    e->sent_at_ms = now_ms;
+                    printf("fd=%d retransmit PUBREL mid=%u\n", c->fd,
+                           e->packet_id);
+                }
+                continue;
+            }
+
+            // QoS1 / QoS2 PUBLISH 阶段：packet id 不变，DUP=1 重发
             if (mqtt_send_publish_packet(c, e->topic, e->topic_len, e->payload,
-                                         e->payload_len, 1, e->retain, 1,
+                                         e->payload_len, e->qos, e->retain, 1,
                                          e->packet_id) == 0) {
                 e->sent_at_ms = now_ms;
-                printf("fd=%d retransmit PUBLISH mid=%u (DUP=1)\n", c->fd,
-                       e->packet_id);
+                printf("fd=%d retransmit PUBLISH mid=%u qos=%u (DUP=1)\n",
+                       c->fd, e->packet_id, e->qos);
             }
             // 发送失败（写缓冲满）就保持旧时间，下一轮再试
         }

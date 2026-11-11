@@ -78,14 +78,29 @@ class MQTTClient:
         clean_session=True,
         keep_alive=60,
         timeout=2.0,
+        will_topic: str | None = None,
+        will_payload: bytes = b"",
+        will_qos: int = 0,
+        will_retain: bool = False,
     ):
         if not clean_session and not client_id:
             raise ValueError("client_id must be non-empty when clean_session=False")
+        if will_topic is not None:
+            if not will_topic:
+                raise ValueError("will_topic must be non-empty")
+            if "+" in will_topic or "#" in will_topic:
+                raise ValueError("will_topic must not contain wildcards")
+            if will_qos not in (0, 1, 2):
+                raise ValueError(f"invalid will_qos: {will_qos}")
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
         self.client_id = client_id
         self.clean_session = clean_session
         self.keep_alive = keep_alive
+        self.will_topic = will_topic
+        self.will_payload = will_payload
+        self.will_qos = will_qos
+        self.will_retain = will_retain
         self._next_mid = 1  #  Message Identifier
         self._rbuf = b""
         self._pending = []  # [FIX] 缓存非预期包，供后续读取
@@ -119,10 +134,21 @@ class MQTTClient:
         flags = 0
         if self.clean_session:
             flags |= 0x02
+        if self.will_topic is not None:
+            flags |= 0x04
+            flags |= (self.will_qos & 0x03) << 3
+            if self.will_retain:
+                flags |= 0x20
         payload += bytes([flags])
         payload += struct.pack(">H", self.keep_alive)
         cid = self.client_id.encode()
         payload += struct.pack(">H", len(cid)) + cid
+
+        if self.will_topic is not None:
+            wt = self.will_topic.encode()
+            wp = bytes(self.will_payload)
+            payload += struct.pack(">H", len(wt)) + wt
+            payload += struct.pack(">H", len(wp)) + wp
 
         fixed = b"\x10" + encode_remaining_length(len(payload)) + bytes(payload)
 
@@ -245,9 +271,35 @@ class MQTTClient:
         pkt = b"\x50\x02" + struct.pack(">H", packet_id)
         self.sock.sendall(pkt)
 
+    def send_pubrel(self, packet_id: int):
+        pkt = b"\x62\x02" + struct.pack(">H", packet_id)
+        self.sock.sendall(pkt)
+
     def send_pubcomp(self, packet_id: int):
         pkt = b"\x70\x02" + struct.pack(">H", packet_id)
         self.sock.sendall(pkt)
+
+    def _expect_pid_ack(self, packet_type, packet_id=None, timeout=None):
+        _, _, body = self.recv_packet_of_type(packet_type, timeout=timeout)
+        if len(body) != 2:
+            raise MQTTProtocolError(
+                f"{packet_type.name} body len {len(body)} != 2"
+            )
+        got_id = struct.unpack(">H", body)[0]
+        if packet_id is not None and got_id != packet_id:
+            raise MQTTProtocolError(
+                f"{packet_type.name} id {got_id} != expected {packet_id}"
+            )
+        return got_id
+
+    def expect_pubrec(self, packet_id: int | None = None, timeout=None):
+        return self._expect_pid_ack(PacketType.PUBREC, packet_id, timeout)
+
+    def expect_pubrel(self, packet_id: int | None = None, timeout=None):
+        return self._expect_pid_ack(PacketType.PUBREL, packet_id, timeout)
+
+    def expect_pubcomp(self, packet_id: int | None = None, timeout=None):
+        return self._expect_pid_ack(PacketType.PUBCOMP, packet_id, timeout)
 
     # ---- 接收 PUBLISH ----
     def recv_publish(self, timeout=None):

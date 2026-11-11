@@ -59,6 +59,8 @@ typedef struct {
     uint8_t proto_level;
     uint8_t clean_session;
     uint8_t has_will;
+    uint8_t will_qos;
+    uint8_t will_retain;
     uint8_t has_username;
     uint8_t has_password;
     uint16_t keep_alive;
@@ -97,8 +99,16 @@ int mqtt_send_publish_qos1(connection_t *c, const char *topic, size_t topic_len,
                            const uint8_t *payload, size_t payload_len,
                            uint8_t retain, uint8_t dup, uint16_t packet_id);
 
+// 编码 QoS 2 PUBLISH（PUBLISH 阶段，随后等 PUBREC）
+int mqtt_send_publish_qos2(connection_t *c, const char *topic, size_t topic_len,
+                           const uint8_t *payload, size_t payload_len,
+                           uint8_t retain, uint8_t dup, uint16_t packet_id);
+
 // 扫描所有连接，把超时未收到 PUBACK 的 QoS1 消息以 DUP=1 重发
 void mqtt_retransmit_all(uint64_t now_ms);
+
+// 连接异常关闭时发布 Will 消息（正常 DISCONNECT 由调用方设置 will_suppress）
+void mqtt_publish_will(connection_t *c);
 
 // ==== SUBSCRIBE / SUBACK ====
 

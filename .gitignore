@@ -12,3 +12,6 @@ wheels/
 # C build artifacts
 *.o
 mqtt-broker
+
+# Broker state file
+mqtt-broker.state*

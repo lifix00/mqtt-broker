@@ -7,10 +7,14 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "config.h"
 #include "connection.h"
 #include "mqtt.h"
+#include "persistence.h"
+#include "retained.h"
 #include "subscription.h"
 
 #define MAX_EVENTS 64
@@ -18,6 +22,50 @@
 
 int g_epfd = -1;
 static int g_listen_marker; // 用一个静态变量地址作为 listener 的标记
+static volatile sig_atomic_t g_shutdown = 0;
+
+static void handle_shutdown_signal(int sig) {
+    (void)sig;
+    g_shutdown = 1;
+}
+
+// 停止 accept，发布所有在线连接的 Will，尽量 flush 已缓冲数据，再统一关闭
+static void broker_shutdown(int listen_fd) {
+    printf("shutting down...\n");
+
+    epoll_ctl(g_epfd, EPOLL_CTL_DEL, listen_fd, NULL);
+    close(listen_fd);
+
+    for (connection_t *c = connection_first(); c; c = connection_next(c)) {
+        if (c->state == SESSION_STATE_CONNECTED)
+            mqtt_publish_will(c);
+    }
+
+    uint64_t deadline = connection_now_ms() + 1000;
+    for (;;) {
+        int pending = 0;
+        for (connection_t *c = connection_first(); c; c = connection_next(c)) {
+            if (c->wpos < c->wlen) {
+                if (connection_try_flush(c) < 0)
+                    continue;
+                if (c->wpos < c->wlen)
+                    pending = 1;
+            }
+        }
+        if (!pending || connection_now_ms() >= deadline)
+            break;
+        struct timespec ts = {0, 10 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+
+    connection_t *c = connection_first();
+    while (c) {
+        connection_t *next = connection_next(c);
+        connection_destroy(c);
+        c = next;
+    }
+    persistence_save();
+}
 
 // 创建一个非阻塞的监听socket，待连接的队列长度128
 static int create_listener(int port) {
@@ -51,16 +99,21 @@ static int create_listener(int port) {
 // rbuf，然后交给mqtt协议层解析
 static void handle_connection_read(connection_t *c) {
     int peer_closed = 0;
+    int buf_full = 0;
 
     for (;;) {
-        if (c->rlen == sizeof(c->rbuf)) {
-            fprintf(stderr, "fd=%d read buffer full, closing\n", c->fd);
-            goto close_conn;
+        if (c->rlen == c->rcap) {
+            if (connection_grow_read(c) < 0) {
+                buf_full = 1;
+                break;
+            }
         }
-        ssize_t n = read(c->fd, c->rbuf + c->rlen, sizeof(c->rbuf) - c->rlen);
+        ssize_t n =
+            read(c->fd, c->rbuf + c->rlen, c->rcap - c->rlen);
 
         if (n > 0) {
             c->rlen += (size_t)n;
+            c->last_rx_ms = connection_now_ms();
         } else if (n == 0) {
             peer_closed = 1;
             break;
@@ -80,6 +133,11 @@ static void handle_connection_read(connection_t *c) {
             return; // 等 EPOLLOUT flush 完再关
         goto close_conn;
     }
+    // 扩容到上限后仍然塞满，且协议层也消费不出完整报文：放弃
+    if (buf_full && c->rlen == c->rcap) {
+        fprintf(stderr, "fd=%d read buffer limit reached, closing\n", c->fd);
+        goto close_conn;
+    }
     if (peer_closed)
         goto close_conn;
     return;
@@ -90,9 +148,40 @@ close_conn:
     connection_destroy(c);
 }
 
+static int parse_long_option(const char *name, const char *value, long min,
+                             long max, long *out) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || v < min || v > max) {
+        fprintf(stderr, "invalid %s: %s\n", name, value);
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+            "usage: %s [options]\n"
+            "  --port PORT\n"
+            "  --state-file PATH\n"
+            "  --max-sessions N       持久会话上限，0 = 不限制\n"
+            "  --max-retained N       retained 上限，0 = 不限制\n"
+            "  --max-subscriptions N  每会话订阅上限，0 = 不限制\n"
+            "  --max-read-buffer N    读缓冲上限（字节）\n"
+            "  --max-write-buffer N   写缓冲上限（字节）\n"
+            "  --qos-retry-ms N       QoS1/QoS2 重传间隔\n",
+            prog);
+}
+
 int main(int argc, char *argv[]) {
     int port = LISTEN_PORT;
+    const char *state_path = "mqtt-broker.state";
+    config_defaults();
+
     for (int i = 1; i < argc; i++) {
+        long v;
         if (strcmp(argv[i], "--port") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--port requires a value\n");
@@ -103,15 +192,62 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "invalid port: %d\n", port);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--state-file") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--state-file requires a value\n");
+                return 1;
+            }
+            state_path = argv[++i];
+        } else if (strcmp(argv[i], "--max-sessions") == 0) {
+            if (i + 1 >= argc ||
+                parse_long_option("--max-sessions", argv[++i], 0, 1000000,
+                                  &v) < 0)
+                return 1;
+            g_config.max_sessions = (int)v;
+        } else if (strcmp(argv[i], "--max-retained") == 0) {
+            if (i + 1 >= argc ||
+                parse_long_option("--max-retained", argv[++i], 0, 1000000,
+                                  &v) < 0)
+                return 1;
+            g_config.max_retained = (int)v;
+        } else if (strcmp(argv[i], "--max-subscriptions") == 0) {
+            if (i + 1 >= argc ||
+                parse_long_option("--max-subscriptions", argv[++i], 0,
+                                  1000000, &v) < 0)
+                return 1;
+            g_config.max_subscriptions = (int)v;
+        } else if (strcmp(argv[i], "--max-read-buffer") == 0) {
+            if (i + 1 >= argc ||
+                parse_long_option("--max-read-buffer", argv[++i], 4096,
+                                  64 * 1024 * 1024, &v) < 0)
+                return 1;
+            g_config.max_read_buffer = (size_t)v;
+        } else if (strcmp(argv[i], "--max-write-buffer") == 0) {
+            if (i + 1 >= argc ||
+                parse_long_option("--max-write-buffer", argv[++i], 4096,
+                                  64 * 1024 * 1024, &v) < 0)
+                return 1;
+            g_config.max_write_buffer = (size_t)v;
+        } else if (strcmp(argv[i], "--qos-retry-ms") == 0) {
+            if (i + 1 >= argc ||
+                parse_long_option("--qos-retry-ms", argv[++i], 100, 600000,
+                                  &v) < 0)
+                return 1;
+            g_config.qos_retry_ms = (int)v;
         } else {
-            fprintf(stderr, "usage: %s [--port PORT]\n", argv[0]);
+            print_usage(argv[0]);
             return 1;
         }
     }
 
     signal(SIGPIPE, SIG_IGN); // 忽略 write 到关闭的 socket 触发的 SIGPIPE
+    signal(SIGTERM, handle_shutdown_signal);
+    signal(SIGINT, handle_shutdown_signal);
+
     session_store_init();
     subscription_init();
+    retained_init();
+    persistence_init(state_path);
 
     int listen_fd = create_listener(port);
     printf("Broker listening on port %d (fd=%d)\n", port, listen_fd);
@@ -132,7 +268,7 @@ int main(int argc, char *argv[]) {
 
     struct epoll_event events[MAX_EVENTS];
     uint64_t last_retry = connection_now_ms();
-    for (;;) {
+    while (!g_shutdown) {
         // 200ms 超时用于驱动 QoS1 超时重传
         int n = epoll_wait(g_epfd, events, MAX_EVENTS, 200);
         if (n < 0) {
@@ -190,15 +326,17 @@ int main(int argc, char *argv[]) {
             if (c->dead)
                 continue; // 已被新连接接管，等本轮事件处理完统一回收
 
+            // 先读完可读数据，避免 DISCONNECT 和 EOF/HUP 同时到达时
+            // 直接按异常断开处理，错误地发布 Will
+            if (events[i].events & EPOLLIN) {
+                handle_connection_read(c);
+                continue;
+            }
+
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                 printf("fd=%d error/hup, closing\n", c->fd);
                 epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
                 connection_destroy(c);
-                continue;
-            }
-
-            if (events[i].events & EPOLLIN) {
-                handle_connection_read(c);
                 continue;
             }
 
@@ -216,17 +354,19 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // 先回收本轮被接管的旧连接，再跑重传/补发
+        // 先检查 Keep Alive 超时，再统一回收 dead 连接（含 Will 发布）
+        uint64_t now = connection_now_ms();
+        connection_check_keepalive(now);
         connection_reap_dead();
 
-        uint64_t now = connection_now_ms();
         if (now - last_retry >= 200) {
             mqtt_retransmit_all(now);
             last_retry = now;
         }
     }
 
-    close(listen_fd);
+    broker_shutdown(listen_fd);
     close(g_epfd);
+    printf("broker stopped\n");
     return 0;
 }

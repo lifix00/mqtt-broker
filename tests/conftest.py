@@ -40,8 +40,9 @@ def broker_port(tmp_path):
     log_path = tmp_path / f"broker-{port}.log"
 
     log_write_f = open(log_path, "w")
+    state_path = tmp_path / "broker.state"
     proc = subprocess.Popen(
-        [str(BROKER_BIN), "--port", str(port)],
+        [str(BROKER_BIN), "--port", str(port), "--state-file", str(state_path)],
         stdout=log_write_f,
         stderr=subprocess.STDOUT,
         text=True,
@@ -65,3 +66,50 @@ def broker_port(tmp_path):
             if content:
                 print(f"\n--- broker log ({log_path}) ---\n{content}\n--------")
         # tmp_path 由 pytest 自动清理
+
+
+@pytest.fixture
+def broker_factory(tmp_path):
+    """启动带自定义参数的 Broker，返回 (port, proc)；测试结束统一清理。"""
+    procs = []
+
+    def start(*args):
+        port = _free_port()
+        state_path = tmp_path / f"factory-state-{len(procs)}.bin"
+        log_path = tmp_path / f"factory-broker-{port}.log"
+        log_f = open(log_path, "w")
+        proc = subprocess.Popen(
+            [
+                str(BROKER_BIN),
+                "--port",
+                str(port),
+                "--state-file",
+                str(state_path),
+                *args,
+            ],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            _wait_port("127.0.0.1", port)
+        except Exception:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            log_f.close()
+            raise
+        procs.append((proc, log_f))
+        return port, proc
+
+    yield start
+
+    for proc, log_f in procs:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        log_f.close()

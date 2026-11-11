@@ -1,21 +1,22 @@
 #include "subscription.h"
+#include "config.h"
 #include "connection.h"
 #include "mqtt.h"
+#include "persistence.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct subscription {
-    char topic_filter[MAX_FILTER_LEN];
-    session_t *session;
-    uint8_t qos;
-    struct subscription *next;
-} subscription_t;
-
 static subscription_t *g_head = NULL;
 
 void subscription_init(void) { g_head = NULL; }
+
+subscription_t *subscription_first(void) { return g_head; }
+
+subscription_t *subscription_next(subscription_t *s) {
+    return s ? s->next : NULL;
+}
 
 int subscription_count(void) {
     int n = 0;
@@ -29,7 +30,23 @@ int subscription_add(session_t *sess, const char *filter, uint8_t qos) {
     for (subscription_t *s = g_head; s; s = s->next) {
         if (s->session == sess && strcmp(s->topic_filter, filter) == 0) {
             s->qos = qos;
+            session_touch(sess);
+            persistence_save();
             return 0;
+        }
+    }
+
+    if (!persistence_is_loading() && g_config.max_subscriptions > 0) {
+        int count = 0;
+        for (subscription_t *s = g_head; s; s = s->next) {
+            if (s->session == sess)
+                count++;
+        }
+        if (count >= g_config.max_subscriptions) {
+            fprintf(stderr,
+                    "session '%s' subscription limit reached (%d)\n",
+                    sess->client_id, g_config.max_subscriptions);
+            return -1;
         }
     }
 
@@ -47,6 +64,8 @@ int subscription_add(session_t *sess, const char *filter, uint8_t qos) {
     s->qos = qos;
     s->next = g_head;
     g_head = s;
+    session_touch(sess);
+    persistence_save();
     return 0;
 }
 
@@ -61,6 +80,7 @@ void subscription_remove_all(session_t *sess) {
             pp = &(*pp)->next;
         }
     }
+    persistence_save();
 }
 
 int subscription_remove(session_t *sess, const char *filter) {
@@ -70,6 +90,8 @@ int subscription_remove(session_t *sess, const char *filter) {
             subscription_t *victim = *pp;
             *pp = victim->next;
             free(victim);
+            session_touch(sess);
+            persistence_save();
             return 1;
         } else {
             pp = &(*pp)->next;
@@ -167,6 +189,64 @@ bool topic_matches(const char *filter, const char *topic) {
     return *t == '\0';
 }
 
+int subscription_deliver_to_session(session_t *sess, const char *topic,
+                                    size_t topic_len, const uint8_t *payload,
+                                    size_t payload_len, uint8_t qos,
+                                    uint8_t retain) {
+    connection_t *c = sess->conn;
+
+    // 离线（或已被接管、等待回收）的会话：QoS0 丢弃，QoS1/QoS2 持久会话入队
+    if (!c || c->dead) {
+        if (qos >= 1 && !sess->clean_session) {
+            if (session_queue_push(sess, topic, topic_len, payload, payload_len,
+                                   qos, retain) == 0) {
+                return 1;
+            }
+            fprintf(stderr, "session '%s' offline queue full, drop message\n",
+                    sess->client_id);
+        }
+        return 0;
+    }
+
+    if (qos == 0) {
+        return mqtt_send_publish_qos0(c, topic, topic_len, payload, payload_len,
+                                      retain, 0) == 0
+                   ? 1
+                   : 0;
+    }
+
+    // QoS1/QoS2：为会话分配 packet id，登记 inflight 后再发送。
+    // QoS1 等 PUBACK；QoS2 等 PUBREC/PUBCOMP。超时由 mqtt_retransmit_all 重传。
+    uint16_t packet_id = session_alloc_packet_id(sess);
+    if (packet_id == 0) {
+        fprintf(stderr, "fd=%d inflight table full, drop qos%u msg\n", c->fd,
+                qos);
+        return 0;
+    }
+
+    inflight_entry_t *e =
+        session_inflight_add(sess, packet_id, qos, retain, topic, topic_len,
+                             payload, payload_len);
+    if (!e) {
+        fprintf(stderr, "fd=%d out of memory for inflight msg\n", c->fd);
+        return 0;
+    }
+
+    int rc;
+    if (qos == 2) {
+        rc = mqtt_send_publish_qos2(c, topic, topic_len, payload, payload_len,
+                                    retain, 0, packet_id);
+    } else {
+        rc = mqtt_send_publish_qos1(c, topic, topic_len, payload, payload_len,
+                                    retain, 0, packet_id);
+    }
+    if (rc < 0) {
+        session_inflight_remove(sess, packet_id);
+        return 0;
+    }
+    return 1;
+}
+
 int subscription_deliver(const char *topic, size_t topic_len,
                           const uint8_t *payload, size_t payload_len,
                           uint8_t pub_qos, uint8_t retain) {
@@ -182,60 +262,13 @@ int subscription_deliver(const char *topic, size_t topic_len,
 
     int delivered = 0;
     for (subscription_t *s = g_head; s; s = s->next) {
-        if (!topic_matches(s->topic_filter, topic_buf)) continue;
-
-        session_t *sess = s->session;
+        if (!topic_matches(s->topic_filter, topic_buf))
+            continue;
 
         // 投递 QoS = min(pub_qos, sub_qos)
         uint8_t deliver_qos = pub_qos < s->qos ? pub_qos : s->qos;
-
-        // 离线会话：QoS0 直接丢弃；QoS1 且持久会话则入队
-        if (!sess->conn) {
-            if (deliver_qos == 1 && !sess->clean_session) {
-                if (session_queue_push(sess, topic, topic_len, payload,
-                                       payload_len, 1, 0) == 0) {
-                    delivered++;
-                } else {
-                    fprintf(stderr,
-                            "session '%s' offline queue full, drop message\n",
-                            sess->client_id);
-                }
-            }
-            continue;
-        }
-
-        connection_t *c = sess->conn;
-        int rc = -1;
-        if (deliver_qos == 0) {
-            rc = mqtt_send_publish_qos0(c, topic, topic_len, payload,
-                                        payload_len, 0, 0);
-        } else {
-            // QoS1：为会话分配 packet id，登记 inflight 后再发送，
-            // 等订阅者回 PUBACK 时清理；超时未确认会由 mqtt_retransmit_all 重传。
-            uint16_t packet_id = session_alloc_packet_id(sess);
-            if (packet_id == 0) {
-                fprintf(stderr, "fd=%d inflight table full, drop qos1 msg\n",
-                        c->fd);
-                continue;
-            }
-
-            inflight_entry_t *e =
-                session_inflight_add(sess, packet_id, 1, 0, topic, topic_len,
-                                     payload, payload_len);
-            if (!e) {
-                fprintf(stderr, "fd=%d out of memory for inflight msg\n",
-                        c->fd);
-                continue;
-            }
-
-            if (mqtt_send_publish_qos1(c, topic, topic_len, payload,
-                                       payload_len, 0, 0, packet_id) < 0) {
-                session_inflight_remove(sess, packet_id);
-                continue;
-            }
-            rc = 0;
-        }
-        if (rc == 0) delivered++;
+        delivered += subscription_deliver_to_session(
+            s->session, topic, topic_len, payload, payload_len, deliver_qos, 0);
     }
     return delivered;
 }

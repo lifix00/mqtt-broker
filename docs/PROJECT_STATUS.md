@@ -1,8 +1,8 @@
 # MQTT Broker 项目进度与计划
 
-> 更新时间：2026-11-10
-> 代码规模：C 源码约 2085 行，Python 测试约 1485 行
-> 当前测试：72 个用例，71 passed，1 skipped（retained 消息尚未实现）
+> 更新时间：2026-11-11
+> 代码规模：C 源码约 3574 行，Python 测试约 2579 行
+> 当前测试：104 个用例，全部通过（0 skipped）
 > 构建状态：`make` 零警告；全量测试在 ASan/UBSan 下通过
 
 ## 1. 项目概览
@@ -17,7 +17,7 @@
 
 技术上使用 C11 实现 Broker，Python + pytest 编写端到端集成测试，测试通过裸 socket 直接验证线上报文，不依赖第三方 MQTT 客户端库。
 
-**当前阶段结论：QoS 1 已完整落地**，包括入站 PUBACK、出站 QoS 1、packet id 管理、inflight 表、PUBACK 清理、DUP 超时重传、持久会话离线队列和重连恢复。下一阶段的主线是 Retained、Will、Keepalive 和 QoS 2。
+**当前阶段结论：M6 核心已完成**。动态读写缓冲、会话/retained/订阅上限与 LRU 淘汰、SIGTERM/SIGINT 优雅退出、CLI 配置都已落地。下一阶段 M7 聚焦工程化收尾：CI、日志指标、认证/TLS、fuzz、持久化事务性与增量快照。
 
 ## 2. 进度总览
 
@@ -36,10 +36,18 @@
 | PUBLISH QoS 1（出站） | ✅ 完成 | 按 `min(pub_qos, sub_qos)` 投递、per-session packet id |
 | QoS 1 确认与重传 | ✅ 完成 | inflight、PUBACK 清理、2s 超时 DUP=1 重传 |
 | 持久会话 clean_session=0 | ✅ 完成 | 会话表、离线队列、重连恢复、旧连接接管 |
-| Retained 消息 | ❌ 未实现 | 测试当前 skip |
-| Will 消息 | ❌ 未实现 | CONNECT 已解析，尚未存储和触发 |
-| Keepalive 超时 | ❌ 未实现 | keep_alive 已解析，未启动超时踢人 |
-| QoS 2 | ❌ 未实现 | 入站 QoS 2 直接断开；订阅 QoS 2 降级授予 0 |
+| Retained 消息 | ✅ 完成 | 按 topic 保存最后一条；新订阅时 RETAIN=1 投递；空 payload 删除 |
+| Will 消息 | ✅ 完成 | 异常断开/协议错误/超时/接管时发布；正常 DISCONNECT 丢弃 |
+| Keepalive 超时 | ✅ 完成 | 1.5 × keep_alive 未收包则断开，并走异常断开路径发布 Will |
+| PUBLISH QoS 2（入站） | ✅ 完成 | PUBLISH → PUBREC → PUBREL → PUBCOMP，重复包不重复投递 |
+| PUBLISH QoS 2（出站） | ✅ 完成 | 订阅者 QoS2、inflight 状态、PUBREL/PUBCOMP、超时重传 |
+| 状态持久化 | ✅ 完成 | retained、持久会话、订阅、inflight、离线队列、QoS2 状态跨重启恢复 |
+| 资源上限与淘汰 | ✅ 完成 | 会话/retained/订阅上限，LRU 淘汰；加载状态时跳过上限 |
+| 动态读写缓冲 | ✅ 完成 | 初始 4KB 按需扩容，支持 128KB+ 报文 |
+| 优雅退出 | ✅ 完成 | SIGTERM/SIGINT：停 accept、发布 Will、flush、落盘、退出 0 |
+| CLI 配置 | ✅ 完成 | 端口、状态文件、上限、缓冲上限、重传间隔 |
+| CI / 指标 | ❌ 未实现 | 尚无自动化 CI 和 metrics 输出 |
+| 持久化事务性 | ❌ 未实现 | 快照级一致性，QoS2 极端崩溃窗口未做事务 |
 | 认证 / TLS | ❌ 未实现 | username/password 已解析，未校验 |
 
 ## 3. 已完成能力
@@ -100,15 +108,136 @@
 - 同一 Client ID 的新连接会接管旧连接：旧连接被关闭，会话状态保留给新连接
 - 旧连接采用延迟回收，避免同一批 epoll 事件中的悬空指针
 
+
+### 3.5 Retained 消息
+
+- 全局 retained 表按**精确 topic** 保存最后一条消息，包含 topic、payload、QoS
+- PUBLISH 带 RETAIN=1 时保存/替换；payload 为空时删除该 topic 的 retained 消息
+- 实时转发给已有订阅者时 RETAIN 一律置 0，只有新订阅触发的投递才置 1
+- SUBSCRIBE 先回 SUBACK，再按每个成功授予的 filter 投递匹配的 retained 消息
+- retained 投递 QoS = `min(retained_qos, granted_qos)`
+- QoS1 retained 投递会登记 inflight，订阅者断开后可在重连时以 DUP=1 重发
+- retained 表常驻内存，Broker 重启后丢失；MQTT 3.1.1 本身没有 retained 过期机制
+
+### 3.6 Will 消息
+
+- CONNECT 解码时提取 Will Flag、Will QoS、Will Retain、Will Topic、Will Payload
+- CONNECT 成功时把 Will 深拷贝到**连接对象**，不放进持久会话，因为 Will 属于本次连接
+- 校验 Will Topic 非空且不含 `+` / `#`；当前只支持 Will QoS 0/1
+- 以下情况发布 Will：
+  - 客户端 socket 直接关闭 / EOF
+  - 读写错误、EPOLLERR / EPOLLHUP
+  - 协议错误导致断开
+  - Keepalive 超时
+  - 同 Client ID 新连接接管旧连接
+- 正常 DISCONNECT 会把 `will_suppress` 置 1，不发布 Will
+- Will 带 Retain 时会同时写入 retained 表；新订阅者能收到 retained 版本
+- Will 发布 QoS1 时按普通 QoS1 投递处理，离线持久会话可入队
+
+### 3.7 Keepalive 超时
+
+- 每个连接记录 `keep_alive`（秒）和 `last_rx_ms`（最后一次收到任何字节的时间）
+- 服务端每 200ms 扫描一次，超过 `1.5 × keep_alive` 没有收到数据就断开
+- `keep_alive=0` 表示关闭超时检测
+- 超时连接标记为 dead，复用统一的延迟回收路径，因此会正常触发 Will
+- 收到 PINGREQ 或其他任意报文都会刷新 `last_rx_ms`
+
+
+### 3.8 QoS 2
+
+**入站（发布者 → Broker）**
+
+- 收到 QoS2 PUBLISH 后先保存到 `incoming_qos2` 表，回 PUBREC，此时不投递
+- 收到 PUBREL 后才调用 `broker_publish` 真正投递，并回 PUBCOMP
+- 重复 PUBLISH（同 packet id）：只重发 PUBREC，不覆盖、不重复投递
+- 重复 PUBREL：仍回 PUBCOMP，但不会再次投递
+- retained 存储在 PUBREL 阶段完成，保证“只写一次”
+- 入站 QoS2 状态属于会话，`clean_session=0` 时随会话持久化
+
+**出站（Broker → 订阅者）**
+
+- 订阅可授予 QoS2，投递 QoS 继续按 `min(pub_qos, sub_qos)` 计算
+- 出站 inflight 记录三阶段状态：
+  - `INFLIGHT_WAIT_PUBACK`：QoS1 等 PUBACK
+  - `INFLIGHT_WAIT_PUBREC`：QoS2 已发 PUBLISH，等 PUBREC
+  - `INFLIGHT_WAIT_PUBCOMP`：QoS2 已发 PUBREL，等 PUBCOMP
+- 收到 PUBREC 后转 `WAIT_PUBCOMP` 并发送 PUBREL
+- 收到 PUBCOMP 后清理 inflight
+- 超时重传：
+  - `WAIT_PUBREC` 阶段重发 PUBLISH，DUP=1、packet id 不变
+  - `WAIT_PUBCOMP` 阶段重发 PUBREL
+- 重连恢复：
+  - 未完成 PUBLISH 阶段的消息以 DUP=1 重发
+  - 已进入 PUBREL 阶段的消息直接重发 PUBREL
+
+### 3.9 状态持久化
+
+- 新增 `persistence.c/.h`，使用二进制快照文件保存 Broker 状态
+- 默认文件：`mqtt-broker.state`，可通过 `--state-file PATH` 指定
+- 保存内容：
+  - retained 表（topic、payload、QoS）
+  - `clean_session=0` 会话：client id、keep_alive、next packet id
+  - 会话订阅（filter、QoS）
+  - 出站 inflight（packet id、QoS、握手状态、retain、topic、payload）
+  - 离线队列（topic、payload、QoS、retain）
+  - 入站 QoS2 表（packet id、retain、topic、payload）
+- 写入策略：每次状态变更后写临时文件 → `fflush` + `fsync` → `rename` 原子替换
+- 启动时加载状态；文件不存在则从空状态开始；文件损坏则清空并写回合法空状态
+- `clean_session=1` 的会话不落盘，符合 MQTT 语义
+- 重传时间戳 `sent_at_ms` 不落盘，重启后按当前时间重新计时
+
+
+### 3.10 资源上限与淘汰
+
+- 默认上限（均可通过 CLI 调整，0 表示不限制）：
+  - 持久会话：1024
+  - retained：4096
+  - 每会话订阅：256
+- 持久会话满时，优先淘汰**最久未活动的离线持久会话**；全部在线时拒绝新持久会话，返回 CONNACK 服务不可用
+- retained 满时淘汰最久未更新的 retained topic
+- 订阅满时 SUBACK 返回 `0x80`，不影响已有订阅
+- LRU 使用单调递增序号而不是墙上时钟，避免同一毫秒内多次操作导致顺序不确定
+- 从状态文件加载时跳过上限检查，避免把刚恢复的数据立即淘汰
+
+### 3.11 动态读写缓冲
+
+- `connection_t` 的 `rbuf` / `wbuf` 从固定数组改为动态指针：
+  - 初始容量 4KB
+  - 读缓冲按 2 倍扩容，默认上限 1MiB
+  - 写缓冲按需扩容，默认上限 2MiB
+  - 写缓冲在扩容前先尝试搬移已发送部分，减少内存增长
+- 读满但还能扩容时继续读；扩容到上限仍无法组成完整报文才断开
+- 128KB payload 的 PUBLISH 已有端到端测试
+- 上限可通过 `--max-read-buffer` / `--max-write-buffer` 调整
+
+### 3.12 优雅退出与配置
+
+- 安装 SIGTERM / SIGINT 处理器，只设置 `sig_atomic_t` 标志
+- 主循环检测到标志后：
+  1. 停止 accept，从 epoll 移除并关闭 listen fd
+  2. 对所有在线连接发布 Will（正常 DISCONNECT 过的连接已抑制）
+  3. 最多 1 秒尝试 flush 所有写缓冲
+  4. 销毁连接：clean session 清理，持久会话保留
+  5. 最后再写一次状态文件并退出 0
+- 新增 `config.c/.h`，所有上限和重传间隔集中管理
+- 新增 CLI：
+  - `--max-sessions` / `--max-retained` / `--max-subscriptions`
+  - `--max-read-buffer` / `--max-write-buffer`
+  - `--qos-retry-ms`
+- 状态文件仍然是写穿（write-through），优雅退出只是兜底保存，不依赖退出时落盘
+
 ## 4. 代码结构
 
 ```text
 src/
-├── main.c            # 启动参数、listen socket、epoll 事件循环、定时重传驱动
+├── main.c            # 启动参数、listen socket、epoll 事件循环、优雅退出
+├── config.c/.h       # 全局配置：资源上限、缓冲上限、重传间隔
 ├── connection.c/.h   # 连接对象、读写缓冲、EPOLLOUT、连接生命周期
-├── mqtt.c/.h         # 报文编解码、协议状态机、CONNECT/PUBLISH/SUBSCRIBE/PUBACK
-├── session.c/.h      # 会话表、clean session、inflight、离线队列、packet id
-└── subscription.c/.h # 订阅链表、主题匹配、消息路由与离线入队
+├── mqtt.c/.h         # 报文编解码、协议状态机、CONNECT/PUBLISH/SUBSCRIBE/PUBACK/Will
+├── session.c/.h      # 会话表、clean session、inflight、入站 QoS2、离线队列
+├── subscription.c/.h # 订阅链表、主题匹配、单会话投递、消息路由与离线入队
+├── retained.c/.h     # retained 消息表、保存/替换/删除、新订阅投递
+└── persistence.c/.h  # 二进制状态快照、原子落盘、启动加载
 
 tests/
 ├── conftest.py       # 每个测试启动/停止 Broker，随机端口
@@ -123,7 +252,13 @@ tests/
 ├── test_errors.py
 ├── test_half_packet.py
 ├── test_client_qos1.py
-└── test_retained.py  # 暂时 skip
+├── test_retained.py
+├── test_will.py
+├── test_keepalive.py
+├── test_qos2.py
+├── test_persistence.py
+├── test_limits.py
+└── test_shutdown.py
 ```
 
 ### 关键数据结构
@@ -139,6 +274,21 @@ session_t
 
 `inflight` 和离线队列都保存在会话层，因此连接断开不会丢失 QoS 1 状态；这是 `clean_session=0` 能恢复的基础。
 
+```text
+connection_t
+├── session / state
+├── keep_alive / last_rx_ms
+└── will_topic / will_payload / will_qos / will_retain / will_suppress
+
+session_t
+├── inflight[]           # 出站 QoS1/QoS2，含握手状态
+├── incoming_qos2[]      # 入站 QoS2，等 PUBREL
+├── queue_head/queue_tail# 离线 QoS1/QoS2
+└── next_packet_id
+```
+
+Will 属于连接而不是会话；连接异常关闭时发布，正常 DISCONNECT 时丢弃。
+
 ## 5. 测试与验证
 
 ### 运行方式
@@ -153,11 +303,11 @@ make test            # 运行全部 pytest（使用 uv）
 ### 当前结果
 
 ```text
-collected 72 items
-71 passed, 1 skipped in 18.69s
+collected 104 items
+104 passed in 41.06s
 ```
 
-跳过项：`test_retained.py::test_retained_message`，原因是 Retained 消息尚未实现。
+没有 skipped 用例：Retained、Will、Keepalive、QoS2、持久化、资源上限、动态缓冲和优雅退出都有端到端测试。
 
 ### 覆盖重点
 
@@ -168,6 +318,16 @@ collected 72 items
 - 多条 QoS1 的 packet id 唯一性
 - 未确认消息的 DUP 重传、PUBACK 后停止重传
 - 持久会话离线队列、重连恢复、clean session 丢弃、旧连接接管
+- Retained 保存、替换、空 payload 删除、QoS1 retained、实时转发 RETAIN=0
+- Will 异常断开发布、正常 DISCONNECT 不发布、协议错误发布、Will Retain、QoS1 Will
+- Keepalive 超时断开、PINGREQ 续命、超时后发布 Will
+- QoS2 入站/出站握手、重复 PUBLISH、重复 PUBREL、PUBLISH/PUBREL 重传
+- QoS2 retained
+- retained/订阅/离线队列/出站 QoS2/incoming QoS2 跨 Broker 重启恢复
+- clean session 不落盘、损坏状态文件回退
+- 会话/retained/订阅上限与 LRU 淘汰
+- 128KB 大 payload 的动态读写缓冲
+- SIGTERM 优雅退出、退出前 Will 发布
 - 断连后订阅清理、二次 CONNECT、CONNECT 前 PING
 
 ### 额外验证
@@ -175,57 +335,60 @@ collected 72 items
 - `-Wall -Wextra` 编译零警告
 - 全量测试在 `-fsanitize=address,undefined` 下通过
 - 手工验证了：双订阅者独立 packet id、只确认其中一条时另一条继续重传、同 Client ID 接管
+- 手工验证了：retained 替换/删除、Will Retain、Keepalive 超时触发 Will
+- 手工验证了：QoS2 重传、incoming/outgoing 状态跨重启、接管时 Will 发布
+- 手工验证了：128KB payload、三类资源上限、SIGTERM 发布 Will 并退出 0
 
 ## 6. 已知限制
 
-1. **会话仅存内存**：Broker 进程重启后，`clean_session=0` 的会话、inflight 和离线队列全部丢失，尚未做磁盘持久化。
-2. **没有会话过期**：MQTT 3.1.1 本身没有 Session Expiry，离线会话会一直保留；后续可以增加管理上限或自定义过期策略。
-3. **单包受读缓冲限制**：`READ_BUF_SIZE=4096`，超过约 4KB 的 PUBLISH 会因读缓冲满而断开；写缓冲上限 64KB。
-4. **队列和 inflight 有上限**：每会话最多 1024 条 inflight、1024 条离线消息，满了会丢弃并打日志。
-5. **重传定时器固定 2 秒**：`QOS1_RETRY_TIMEOUT_MS` 是编译期常量，尚未做成配置项。
-6. **Keepalive 未生效**：`keep_alive` 已解析，但没有超时检测和断开逻辑。
-7. **Will / Retained 未实现**：CONNECT 中解析了 Will 字段，但未存储、未在异常断开时发布；Retained 消息未保存，实时转发时 RETAIN 一律置 0。
-8. **QoS 2 未实现**：收到 QoS 2 PUBLISH 会断开；SUBSCRIBE 请求 QoS 2 时按 0 授予。
-9. **无认证与加密**：username/password 只解析不校验，不支持 TLS。
-10. **无优雅退出**：Broker 收到 SIGTERM 时直接退出，未做连接和会话清理。
+1. **持久化是整文件快照**：每次状态变更都会重写整个状态文件并 `fsync`，状态大时写放大会明显；后续可改为 journal / 增量快照。
+2. **崩溃一致性是快照级，不是事务级**：极端情况下在 QoS2 PUBREL 处理中途崩溃，重启后可能出现重复投递或确认丢失；正常停机/重启路径已测试。
+3. **没有会话/retained 过期**：MQTT 3.1.1 本身没有 Session Expiry 和 retained 过期，离线会话与 retained 会一直保留到被 LRU 淘汰或手动清理。
+4. **有硬性缓冲上限**：默认读 1MiB、写 2MiB；超过上限的单包会被断开，可通过 CLI 调大，但不是无限支持。
+5. **队列和 inflight 仍固定为 1024**：每会话最多 1024 条 inflight、1024 条离线消息、1024 条入站 QoS2，满了会丢弃/断开并打日志。
+6. **Keepalive 是字节级计时**：收到任意字节都会刷新 `last_rx_ms`，不是严格的“完整控制包”级计时；扫描周期 200ms。
+7. **没有 CONNECT 超时**：客户端连上后一直不发 CONNECT 不会被主动清理。
+8. **Will / Retained 大 topic 限制**：实时转发路径仍使用 256 字节 topic 缓冲，超过该长度的 topic 在实时投递时会被丢弃（retained 新订阅路径不受此限制）。
+9. **优雅退出最多等 1 秒 flush**：对端极慢时，部分 Will/QoS 消息可能未发出；持久会话的 inflight 会在下次重连时重发。
+10. **无认证与加密**：username/password 只解析不校验，不支持 TLS；状态文件是明文。
+11. **没有 CI / 指标 / fuzz**：目前靠本地 pytest + ASan/UBSan，尚未接入自动化 CI 和运行指标。
+12. **状态文件无压缩/迁移**：格式升级需要手动兼容，旧版本状态文件可能被当作损坏文件清空。
 
 ## 7. 下一阶段计划
 
-### P0：补齐 MQTT 3.1.1 常用能力
+### P0：工程化收尾
 
 | 任务 | 说明 | 验收标准 |
 | --- | --- | --- |
-| Retained 消息 | 保存每个 topic 的最后一条 retained PUBLISH；新订阅时投递并置 RETAIN=1；空 payload 删除 retained | 取消 `test_retained.py` 的 skip，补充新增/覆盖/删除用例 |
-| Will 消息 | CONNECT 时保存 Will topic/payload/QoS/retain；异常断开时发布，正常 DISCONNECT 时丢弃 | 异常断线（直接 close）后订阅者收到 Will；正常 DISCONNECT 不收到 |
-| Keepalive | 每个连接记录最后收包时间；超过 1.5 × keep_alive 未收到任何报文则断开 | 客户端不发 PING 超时被断开；正常 PING 保持连接 |
-| 统一异常断开路径 | 区分正常 DISCONNECT 与异常断开，为 Will 和日志提供依据 | 正常/异常断开行为可区分并可测试 |
+| CI | `make` + pytest + sanitizer 在 CI 自动执行 | 每次提交自动跑 |
+| 日志与指标 | 连接数、订阅数、inflight、retained、丢弃计数，支持日志级别 | 可通过日志/指标观察运行状态 |
+| 持久化事务性 | 解决 QoS2 PUBREL 中途崩溃的重复/丢失窗口 | 崩溃注入测试通过 |
+| 状态文件演进 | 版本迁移、增量快照或 journal，降低写放大 | 大状态写入可接受 |
 
-### P1：QoS 2 与会话可靠性
-
-| 任务 | 说明 | 验收标准 |
-| --- | --- | --- |
-| QoS 2 入站 | PUBLISH → PUBREC → PUBREL → PUBCOMP，去重 | 重复 packet id 不重复投递；完整握手可测试 |
-| QoS 2 出站 | 维护 QoS2 inflight 状态，处理 PUBREC/PUBREL/PUBCOMP | 订阅者完成握手后状态清理 |
-| 会话磁盘持久化 | 将 session、订阅、inflight、离线队列落盘，启动时恢复 | 重启 Broker 后 `clean_session=0` 会话可恢复 |
-| 会话数量/内存上限 | 限制离线会话数量，必要时淘汰最旧会话 | 大量离线 Client 不会耗尽内存 |
-
-### P2：工程化与可运维性
+### P1：协议与运维能力
 
 | 任务 | 说明 | 验收标准 |
 | --- | --- | --- |
-| 动态读缓冲 | 支持大于 4KB 的 PUBLISH，按 Remaining Length 扩容 | 64KB payload 可正常收发 |
-| 配置化 | 端口、重传间隔、队列上限、日志级别从配置/环境变量读取 | 不改代码即可调整 |
-| 单元测试 | 为 topic 匹配、长度编解码、session 表写纯 C 或 Python 单测 | 边界用例覆盖 |
-| CI | `make` + pytest + sanitizer 自动执行 | 每次提交自动跑 |
-| 日志与指标 | 连接数、订阅数、inflight 数、丢弃计数 | 可观测 |
 | 认证/TLS | 用户名密码校验与 TLS 接入 | 可选启用 |
+| CONNECT 超时与大 topic | 半开连接回收；动态 topic 缓冲 | 长 topic/半开连接可测试 |
+| 队列上限配置化 | 把 inflight/离线队列/QoS2 表上限也纳入配置 | 不改代码即可调整 |
+| 配置文件中文化 | CLI 之外的配置文件支持 | 适合容器/服务化部署 |
+
+### P2：健壮性验证
+
+| 任务 | 说明 | 验收标准 |
+| --- | --- | --- |
+| 模糊测试 | 固定头、Remaining Length、CONNECT/PUBLISH、状态文件 | 不崩溃、不越界 |
+| 崩溃注入 | 在 PUBREL/落盘关键点注入崩溃 | 状态可恢复或明确失败 |
+| 长稳测试 | 大量连接、订阅、retained 循环 | 内存/句柄不泄漏 |
+| 文档与示例 | 部署、配置、限制说明 | 新用户可独立跑通 |
 
 ## 8. 建议的推进顺序
 
-1. **先做 P0 的 Retained + Will + Keepalive**：这三项是 MQTT 3.1.1 最常用、也最容易在真实客户端上暴露问题的能力。
-2. **再做 QoS 2**：在现有 QoS1 inflight 基础上扩展状态机，避免过早引入会话落盘复杂度。
-3. **然后做会话落盘和上限**：让 `clean_session=0` 在 Broker 重启后仍然成立。
-4. **最后做工程化**：动态缓冲、配置化、CI、日志指标、认证/TLS。
+1. **先做 CI + 日志指标**：把已有 104 个测试和 sanitizer 固化成流水线。
+2. **再做持久化事务性与状态文件演进**：解决写放大和 QoS2 崩溃窗口。
+3. **然后做认证/TLS、CONNECT 超时、大 topic、队列上限配置化**。
+4. **最后做 fuzz、崩溃注入、长稳测试**。
 
 ## 9. 里程碑
 
@@ -234,6 +397,7 @@ collected 72 items
 | M1 | epoll 网络层 + MQTT 骨架 + CONNECT/PING/DISCONNECT | ✅ |
 | M2 | 订阅/通配符 + QoS 0 发布订阅 | ✅ |
 | M3 | QoS 1 完整链路 + 持久会话与断线恢复 | ✅ |
-| M4 | Retained + Will + Keepalive | ⏳ 下一步 |
-| M5 | QoS 2 + 会话磁盘持久化 | 计划中 |
-| M6 | 工程化与可运维性 | 计划中 |
+| M4 | Retained + Will + Keepalive | ✅ |
+| M5 | QoS 2 + 会话/Retained 磁盘持久化 | ✅ |
+| M6 | 资源上限、动态缓冲、优雅退出、CLI 配置 | ✅ |
+| M7 | CI、日志指标、认证/TLS、fuzz、持久化事务性 | ⏳ 下一步 |

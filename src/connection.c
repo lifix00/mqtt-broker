@@ -1,4 +1,6 @@
+#include "config.h"
 #include "connection.h"
+#include "mqtt.h"
 #include "session.h"
 #include "subscription.h"
 
@@ -23,13 +25,27 @@ connection_t *connection_create(int fd) {
     connection_t *c = calloc(1, sizeof(*c));
     if (!c)
         return NULL;
+
+    c->rbuf = malloc(INIT_READ_BUF_SIZE);
+    c->wbuf = malloc(INIT_WRITE_BUF_SIZE);
+    if (!c->rbuf || !c->wbuf) {
+        free(c->rbuf);
+        free(c->wbuf);
+        free(c);
+        return NULL;
+    }
+
     c->fd = fd;
     c->rlen = 0;
+    c->rcap = INIT_READ_BUF_SIZE;
     c->wlen = 0;
     c->wpos = 0;
+    c->wcap = INIT_WRITE_BUF_SIZE;
     c->epoll_events = 0;
     c->session = NULL;
     c->state = SESSION_STATE_CONNECTING;
+    c->keep_alive = 0;
+    c->last_rx_ms = connection_now_ms();
     c->dead = 0;
     c->want_close = 0;
 
@@ -75,6 +91,13 @@ void connection_destroy(connection_t *c) {
             session_destroy(s);
     }
 
+    // 异常断开时发布 Will；正常 DISCONNECT 已把 will_suppress 置 1
+    mqtt_publish_will(c);
+
+    free(c->will_topic);
+    free(c->will_payload);
+    free(c->rbuf);
+    free(c->wbuf);
     close(c->fd);
     free(c);
 }
@@ -91,7 +114,77 @@ void connection_reap_dead(void) {
     }
 }
 
-// ==== QoS1 inflight 管理 ====
+void connection_check_keepalive(uint64_t now_ms) {
+    for (connection_t *c = g_connections; c; c = c->next) {
+        if (c->dead || c->state != SESSION_STATE_CONNECTED ||
+            c->keep_alive == 0)
+            continue;
+
+        // MQTT 3.1.1：1.5 倍 Keep Alive 内没有收到任何报文则断开
+        uint64_t limit = (uint64_t)c->keep_alive * 1500u;
+        if (now_ms - c->last_rx_ms > limit) {
+            printf("fd=%d keepalive timeout after %u s\n", c->fd,
+                   c->keep_alive);
+            c->dead = 1;
+            c->want_close = 1;
+            epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+        }
+    }
+}
+
+// ==== 动态缓冲 ====
+
+int connection_grow_read(connection_t *c) {
+    size_t max = g_config.max_read_buffer;
+    if (c->rcap >= max)
+        return -1;
+
+    size_t ncap = c->rcap * 2;
+    if (ncap > max)
+        ncap = max;
+
+    char *p = realloc(c->rbuf, ncap);
+    if (!p)
+        return -1;
+    c->rbuf = p;
+    c->rcap = ncap;
+    return 0;
+}
+
+static int connection_ensure_write(connection_t *c, size_t extra) {
+    if (c->wlen + extra <= c->wcap)
+        return 0;
+
+    // 先尝试把已发送部分移走，避免不必要地扩容
+    if (c->wpos > 0) {
+        memmove(c->wbuf, c->wbuf + c->wpos, c->wlen - c->wpos);
+        c->wlen -= c->wpos;
+        c->wpos = 0;
+        if (c->wlen + extra <= c->wcap)
+            return 0;
+    }
+
+    size_t max = g_config.max_write_buffer;
+    size_t need = c->wlen + extra;
+    if (need > max)
+        return -1;
+
+    size_t ncap = c->wcap;
+    while (ncap < need) {
+        if (ncap >= max)
+            return -1;
+        ncap *= 2;
+        if (ncap > max)
+            ncap = max;
+    }
+
+    char *p = realloc(c->wbuf, ncap);
+    if (!p)
+        return -1;
+    c->wbuf = p;
+    c->wcap = ncap;
+    return 0;
+}
 
 int connection_get_fd(connection_t *c) { return c->fd; }
 
@@ -146,8 +239,9 @@ int connection_try_flush(connection_t *c) {
 
 // 上层调用的函数接口，先缓冲，再尝试发
 int connection_send(connection_t *c, const void *data, size_t n) {
-    if (c->wlen + n > WRITE_BUF_SIZE) {
-        fprintf(stderr, "fd=%d write buffer overflow, closing\n", c->fd);
+    if (connection_ensure_write(c, n) < 0) {
+        fprintf(stderr, "fd=%d write buffer limit exceeded, closing\n",
+                c->fd);
         return -1;
     }
     memcpy(c->wbuf + c->wlen, data, n);

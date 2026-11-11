@@ -6,6 +6,7 @@
 
 #define MAX_INFLIGHT         1024
 #define MAX_QUEUED_MESSAGES  1024
+#define MAX_INCOMING_QOS2    1024
 #define MAX_CLIENT_ID_LEN    128
 
 struct connection;
@@ -16,11 +17,19 @@ typedef enum {
     SESSION_STATE_CONNECTED,
 } session_state_t;
 
-// 一条已发送、等待 PUBACK 的 QoS1 消息
+// 出站消息当前处于 QoS1/QoS2 握手的哪个阶段
+typedef enum {
+    INFLIGHT_WAIT_PUBACK = 0,  // QoS1：等待 PUBACK
+    INFLIGHT_WAIT_PUBREC,      // QoS2：已发 PUBLISH，等待 PUBREC
+    INFLIGHT_WAIT_PUBCOMP,     // QoS2：已发 PUBREL，等待 PUBCOMP
+} inflight_state_t;
+
+// 一条已发送、等待确认的 QoS1/QoS2 消息
 typedef struct inflight_entry {
     uint16_t packet_id;
     uint8_t  in_use;
     uint8_t  qos;
+    uint8_t  state;
     uint8_t  retain;
     uint64_t sent_at_ms; // 上次发送时间，用于超时重传
 
@@ -31,7 +40,18 @@ typedef struct inflight_entry {
     size_t   payload_len;
 } inflight_entry_t;
 
-// 离线会话排队等待发送的 QoS1 消息
+// 收到的 QoS2 PUBLISH：等 PUBREL 期间保存，保证只投递一次
+typedef struct incoming_qos2_entry {
+    uint16_t packet_id;
+    uint8_t  in_use;
+    uint8_t  retain;
+    char    *topic;
+    size_t   topic_len;
+    uint8_t *payload;
+    size_t   payload_len;
+} incoming_qos2_entry_t;
+
+// 离线会话排队等待发送的 QoS1/QoS2 消息
 typedef struct queued_message {
     char    *topic;
     size_t   topic_len;
@@ -59,6 +79,11 @@ typedef struct session {
     queued_message_t *queue_tail;
     int queue_count;
 
+    incoming_qos2_entry_t incoming_qos2[MAX_INCOMING_QOS2];
+    int incoming_qos2_count;
+
+    uint64_t last_active_seq; // LRU 淘汰用（单调递增序号）
+
     struct session *hash_next; // 会话表桶内链
 } session_t;
 
@@ -74,6 +99,9 @@ void session_detach(session_t *s);
 
 session_t *session_first(void);
 session_t *session_next(session_t *s);
+void session_clear_all(void);
+void session_touch(session_t *s);
+int session_persistent_count(void);
 
 // ==== 出站 QoS1：packet id 与 inflight ====
 uint16_t session_alloc_packet_id(session_t *s);
@@ -85,6 +113,15 @@ inflight_entry_t *session_inflight_add(session_t *s, uint16_t packet_id,
                                        size_t payload_len);
 int session_inflight_remove(session_t *s, uint16_t packet_id);
 void session_inflight_clear(session_t *s);
+
+// ==== 入站 QoS2 ====
+incoming_qos2_entry_t *session_incoming_qos2_find(session_t *s,
+                                                  uint16_t packet_id);
+incoming_qos2_entry_t *session_incoming_qos2_add(
+    session_t *s, uint16_t packet_id, uint8_t retain, const char *topic,
+    size_t topic_len, const uint8_t *payload, size_t payload_len);
+int session_incoming_qos2_remove(session_t *s, uint16_t packet_id);
+void session_incoming_qos2_clear(session_t *s);
 
 // ==== 离线队列 ====
 int session_queue_push(session_t *s, const char *topic, size_t topic_len,
