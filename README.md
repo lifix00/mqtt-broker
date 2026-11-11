@@ -8,6 +8,9 @@ C11 + epoll 实现的 MQTT 3.1.1 Broker，支持：
 - 会话 / Retained / QoS2 状态的磁盘持久化
 - 动态读写缓冲、资源上限与 LRU 淘汰
 - SIGTERM / SIGINT 优雅退出
+- 可选用户名密码认证
+- 运行指标（`SIGUSR1` 或周期日志）
+- GitHub Actions CI
 
 ## 构建与运行
 
@@ -27,6 +30,15 @@ make
 --max-read-buffer N     读缓冲上限（默认 1 MiB）
 --max-write-buffer N    写缓冲上限（默认 2 MiB）
 --qos-retry-ms N        QoS1/QoS2 重传间隔（默认 2000ms）
+--stats-interval-ms N   周期打印统计，0 = 关闭（默认 0）
+--username USER         启用用户名认证
+--password PASS         启用密码认证（需同时提供 --username）
+```
+
+运行时可以用 `kill -USR1 <pid>` 立即打印一行统计：
+
+```text
+stats: conn_active=1 conn_accepted=2 conn_closed=1 ... messages_received=1 messages_sent=1
 ```
 
 ## 测试
@@ -36,6 +48,14 @@ make test
 # 或
 .venv/bin/python -m pytest tests/ -q
 ```
+
+## CI
+
+`.github/workflows/ci.yml` 在 push/PR 时执行：
+
+1. `make`
+2. 普通 pytest
+3. ASan/UBSan 构建 + 全量 pytest
 
 ## 文档
 

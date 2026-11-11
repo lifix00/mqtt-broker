@@ -82,6 +82,8 @@ class MQTTClient:
         will_payload: bytes = b"",
         will_qos: int = 0,
         will_retain: bool = False,
+        username: str | None = None,
+        password: str | None = None,
     ):
         if not clean_session and not client_id:
             raise ValueError("client_id must be non-empty when clean_session=False")
@@ -92,6 +94,8 @@ class MQTTClient:
                 raise ValueError("will_topic must not contain wildcards")
             if will_qos not in (0, 1, 2):
                 raise ValueError(f"invalid will_qos: {will_qos}")
+        if password is not None and username is None:
+            raise ValueError("password requires username")
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
         self.client_id = client_id
@@ -101,6 +105,8 @@ class MQTTClient:
         self.will_payload = will_payload
         self.will_qos = will_qos
         self.will_retain = will_retain
+        self.username = username
+        self.password = password
         self._next_mid = 1  #  Message Identifier
         self._rbuf = b""
         self._pending = []  # [FIX] 缓存非预期包，供后续读取
@@ -139,6 +145,10 @@ class MQTTClient:
             flags |= (self.will_qos & 0x03) << 3
             if self.will_retain:
                 flags |= 0x20
+        if self.username is not None:
+            flags |= 0x80
+            if self.password is not None:
+                flags |= 0x40
         payload += bytes([flags])
         payload += struct.pack(">H", self.keep_alive)
         cid = self.client_id.encode()
@@ -149,6 +159,13 @@ class MQTTClient:
             wp = bytes(self.will_payload)
             payload += struct.pack(">H", len(wt)) + wt
             payload += struct.pack(">H", len(wp)) + wp
+
+        if self.username is not None:
+            user = self.username.encode()
+            payload += struct.pack(">H", len(user)) + user
+            if self.password is not None:
+                pwd = self.password.encode()
+                payload += struct.pack(">H", len(pwd)) + pwd
 
         fixed = b"\x10" + encode_remaining_length(len(payload)) + bytes(payload)
 

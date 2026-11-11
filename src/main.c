@@ -12,6 +12,7 @@
 
 #include "config.h"
 #include "connection.h"
+#include "metrics.h"
 #include "mqtt.h"
 #include "persistence.h"
 #include "retained.h"
@@ -23,10 +24,16 @@
 int g_epfd = -1;
 static int g_listen_marker; // 用一个静态变量地址作为 listener 的标记
 static volatile sig_atomic_t g_shutdown = 0;
+static volatile sig_atomic_t g_stats_requested = 0;
 
 static void handle_shutdown_signal(int sig) {
     (void)sig;
     g_shutdown = 1;
+}
+
+static void handle_stats_signal(int sig) {
+    (void)sig;
+    g_stats_requested = 1;
 }
 
 // 停止 accept，发布所有在线连接的 Will，尽量 flush 已缓冲数据，再统一关闭
@@ -114,6 +121,7 @@ static void handle_connection_read(connection_t *c) {
         if (n > 0) {
             c->rlen += (size_t)n;
             c->last_rx_ms = connection_now_ms();
+            metrics_bytes_in((size_t)n);
         } else if (n == 0) {
             peer_closed = 1;
             break;
@@ -171,7 +179,10 @@ static void print_usage(const char *prog) {
             "  --max-subscriptions N  每会话订阅上限，0 = 不限制\n"
             "  --max-read-buffer N    读缓冲上限（字节）\n"
             "  --max-write-buffer N   写缓冲上限（字节）\n"
-            "  --qos-retry-ms N       QoS1/QoS2 重传间隔\n",
+            "  --qos-retry-ms N       QoS1/QoS2 重传间隔\n"
+            "  --stats-interval-ms N  定期打印统计，0 = 关闭\n"
+            "  --username USER        启用用户名认证\n"
+            "  --password PASS        启用密码认证（需同时提供 --username）\n",
             prog);
 }
 
@@ -234,15 +245,39 @@ int main(int argc, char *argv[]) {
                                   &v) < 0)
                 return 1;
             g_config.qos_retry_ms = (int)v;
+        } else if (strcmp(argv[i], "--stats-interval-ms") == 0) {
+            if (i + 1 >= argc ||
+                parse_long_option("--stats-interval-ms", argv[++i], 0,
+                                  3600000, &v) < 0)
+                return 1;
+            g_config.stats_interval_ms = (int)v;
+        } else if (strcmp(argv[i], "--username") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--username requires a value\n");
+                return 1;
+            }
+            g_config.auth_username = argv[++i];
+        } else if (strcmp(argv[i], "--password") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--password requires a value\n");
+                return 1;
+            }
+            g_config.auth_password = argv[++i];
         } else {
             print_usage(argv[0]);
             return 1;
         }
     }
 
+    if (g_config.auth_password && !g_config.auth_username) {
+        fprintf(stderr, "--password requires --username\n");
+        return 1;
+    }
+
     signal(SIGPIPE, SIG_IGN); // 忽略 write 到关闭的 socket 触发的 SIGPIPE
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGINT, handle_shutdown_signal);
+    signal(SIGUSR1, handle_stats_signal);
 
     session_store_init();
     subscription_init();
@@ -268,6 +303,7 @@ int main(int argc, char *argv[]) {
 
     struct epoll_event events[MAX_EVENTS];
     uint64_t last_retry = connection_now_ms();
+    uint64_t last_stats = connection_now_ms();
     while (!g_shutdown) {
         // 200ms 超时用于驱动 QoS1 超时重传
         int n = epoll_wait(g_epfd, events, MAX_EVENTS, 200);
@@ -317,6 +353,7 @@ int main(int argc, char *argv[]) {
                         continue;
                     }
                     c->epoll_events = EPOLLIN;
+                    metrics_connection_opened();
                 }
                 continue;
             }
@@ -358,6 +395,16 @@ int main(int argc, char *argv[]) {
         uint64_t now = connection_now_ms();
         connection_check_keepalive(now);
         connection_reap_dead();
+
+        if (g_stats_requested) {
+            g_stats_requested = 0;
+            metrics_dump();
+        }
+        if (g_config.stats_interval_ms > 0 &&
+            now - last_stats >= (uint64_t)g_config.stats_interval_ms) {
+            metrics_dump();
+            last_stats = now;
+        }
 
         if (now - last_retry >= 200) {
             mqtt_retransmit_all(now);

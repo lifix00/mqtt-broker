@@ -1,4 +1,5 @@
 #include "config.h"
+#include "metrics.h"
 #include "mqtt.h"
 #include "persistence.h"
 #include "retained.h"
@@ -132,6 +133,8 @@ int mqtt_decode_connect(const uint8_t *body, size_t body_len,
         return -1;
     if (out->will_qos == 3)
         return -1; // 保留值，非法
+    if (out->has_password && !out->has_username)
+        return -1; // MQTT 3.1.1：没有用户名时不能有密码
 
     // 4. Keep Alive（2 字节，大端）
     if (remain < 2)
@@ -546,6 +549,26 @@ static int handle_connect(connection_t *c, const uint8_t *body,
         return -1; // 发完就关
     }
 
+    // 用户名密码认证（可选）
+    if (g_config.auth_username) {
+        size_t user_len = strlen(g_config.auth_username);
+        int ok = mc.has_username && mc.username_len == user_len &&
+                 memcmp(mc.username, g_config.auth_username, user_len) == 0;
+
+        if (ok && g_config.auth_password) {
+            size_t pass_len = strlen(g_config.auth_password);
+            ok = mc.has_password && mc.password_len == pass_len &&
+                 memcmp(mc.password, g_config.auth_password, pass_len) == 0;
+        }
+
+        if (!ok) {
+            fprintf(stderr, "fd=%d authentication failed\n", c->fd);
+            send_connack(c, 0, MQTT_CONNACK_BAD_CREDENTIALS);
+            connection_request_close(c);
+            return -1;
+        }
+    }
+
     // Client ID 校验
     if (mc.client_id_len == 0 && !mc.clean_session) {
         fprintf(stderr, "fd=%d empty client id with clean_session=0\n", c->fd);
@@ -639,6 +662,7 @@ static int handle_publish(connection_t *c, const uint8_t *body, size_t body_len,
         return -1;
     }
 
+    metrics_message_received();
     printf("fd=%d PUBLISH topic='%.*s' payload=%zu bytes qos=%u retain=%u\n",
            c->fd, (int)p.topic_len, p.topic, p.payload_len, p.qos, p.retain);
 

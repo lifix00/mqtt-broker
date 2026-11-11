@@ -1,6 +1,7 @@
 #include "subscription.h"
 #include "config.h"
 #include "connection.h"
+#include "metrics.h"
 #include "mqtt.h"
 #include "persistence.h"
 
@@ -205,14 +206,18 @@ int subscription_deliver_to_session(session_t *sess, const char *topic,
             fprintf(stderr, "session '%s' offline queue full, drop message\n",
                     sess->client_id);
         }
+        metrics_message_dropped();
         return 0;
     }
 
     if (qos == 0) {
-        return mqtt_send_publish_qos0(c, topic, topic_len, payload, payload_len,
-                                      retain, 0) == 0
-                   ? 1
-                   : 0;
+        if (mqtt_send_publish_qos0(c, topic, topic_len, payload, payload_len,
+                                   retain, 0) < 0) {
+            metrics_message_dropped();
+            return 0;
+        }
+        metrics_message_sent();
+        return 1;
     }
 
     // QoS1/QoS2：为会话分配 packet id，登记 inflight 后再发送。
@@ -221,6 +226,7 @@ int subscription_deliver_to_session(session_t *sess, const char *topic,
     if (packet_id == 0) {
         fprintf(stderr, "fd=%d inflight table full, drop qos%u msg\n", c->fd,
                 qos);
+        metrics_message_dropped();
         return 0;
     }
 
@@ -229,6 +235,7 @@ int subscription_deliver_to_session(session_t *sess, const char *topic,
                              payload, payload_len);
     if (!e) {
         fprintf(stderr, "fd=%d out of memory for inflight msg\n", c->fd);
+        metrics_message_dropped();
         return 0;
     }
 
@@ -242,8 +249,10 @@ int subscription_deliver_to_session(session_t *sess, const char *topic,
     }
     if (rc < 0) {
         session_inflight_remove(sess, packet_id);
+        metrics_message_dropped();
         return 0;
     }
+    metrics_message_sent();
     return 1;
 }
 

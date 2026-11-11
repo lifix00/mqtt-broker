@@ -1,5 +1,6 @@
 #include "config.h"
 #include "connection.h"
+#include "metrics.h"
 #include "mqtt.h"
 #include "session.h"
 #include "subscription.h"
@@ -100,6 +101,7 @@ void connection_destroy(connection_t *c) {
     free(c->wbuf);
     close(c->fd);
     free(c);
+    metrics_connection_closed();
 }
 
 // 处理完一批 epoll 事件后，统一回收被接管的旧连接。
@@ -216,6 +218,7 @@ int connection_try_flush(connection_t *c) {
         ssize_t n = write(c->fd, c->wbuf + c->wpos, c->wlen - c->wpos);
         if (n > 0) {
             c->wpos += n;
+            metrics_bytes_out((size_t)n);
         } else if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // 内核缓冲满，等 EPOLLOUT

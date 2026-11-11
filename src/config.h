@@ -10,6 +10,11 @@ typedef struct {
     size_t max_read_buffer;
     size_t max_write_buffer;
     int qos_retry_ms;
+    int stats_interval_ms;
+
+    // 可选用户名/密码认证；username 为 NULL 表示关闭认证
+    const char *auth_username;
+    const char *auth_password;
 } broker_config_t;
 
 extern broker_config_t g_config;

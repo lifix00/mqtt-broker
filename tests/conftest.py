@@ -99,6 +99,7 @@ def broker_factory(tmp_path):
                 proc.wait()
             log_f.close()
             raise
+        proc.log_path = log_path
         procs.append((proc, log_f))
         return port, proc
 

@@ -1,8 +1,8 @@
 # MQTT Broker 项目进度与计划
 
 > 更新时间：2026-11-11
-> 代码规模：C 源码约 3574 行，Python 测试约 2579 行
-> 当前测试：104 个用例，全部通过（0 skipped）
+> 代码规模：C 源码约 3730 行，Python 测试约 2710 行
+> 当前测试：111 个用例，全部通过（0 skipped）
 > 构建状态：`make` 零警告；全量测试在 ASan/UBSan 下通过
 
 ## 1. 项目概览
@@ -17,7 +17,7 @@
 
 技术上使用 C11 实现 Broker，Python + pytest 编写端到端集成测试，测试通过裸 socket 直接验证线上报文，不依赖第三方 MQTT 客户端库。
 
-**当前阶段结论：M6 核心已完成**。动态读写缓冲、会话/retained/订阅上限与 LRU 淘汰、SIGTERM/SIGINT 优雅退出、CLI 配置都已落地。下一阶段 M7 聚焦工程化收尾：CI、日志指标、认证/TLS、fuzz、持久化事务性与增量快照。
+**当前阶段结论：M7 核心已完成**。CI、运行指标、用户名密码认证都已落地。下一阶段 M8 聚焦 TLS、fuzz、持久化事务性、日志级别与指标导出。
 
 ## 2. 进度总览
 
@@ -46,9 +46,12 @@
 | 动态读写缓冲 | ✅ 完成 | 初始 4KB 按需扩容，支持 128KB+ 报文 |
 | 优雅退出 | ✅ 完成 | SIGTERM/SIGINT：停 accept、发布 Will、flush、落盘、退出 0 |
 | CLI 配置 | ✅ 完成 | 端口、状态文件、上限、缓冲上限、重传间隔 |
-| CI / 指标 | ❌ 未实现 | 尚无自动化 CI 和 metrics 输出 |
+| CI | ✅ 完成 | GitHub Actions：构建、pytest、ASan/UBSan |
+| 运行指标 | ✅ 完成 | 计数器 + `SIGUSR1`/周期日志输出 |
+| 用户名密码认证 | ✅ 完成 | 可选启用，失败返回 CONNACK 4 |
+| TLS | ❌ 未实现 | 目前仍是明文 TCP |
+| Fuzz / 崩溃注入 | ❌ 未实现 | 尚未接入 fuzzer |
 | 持久化事务性 | ❌ 未实现 | 快照级一致性，QoS2 极端崩溃窗口未做事务 |
-| 认证 / TLS | ❌ 未实现 | username/password 已解析，未校验 |
 
 ## 3. 已完成能力
 
@@ -226,12 +229,49 @@
   - `--qos-retry-ms`
 - 状态文件仍然是写穿（write-through），优雅退出只是兜底保存，不依赖退出时落盘
 
+
+### 3.13 用户名密码认证
+
+- 通过 CLI 启用：
+  - `--username USER`：启用用户名认证
+  - `--password PASS`：同时校验密码（必须配合 `--username`）
+- CONNECT 中缺少或错误的凭据返回 CONNACK `4`（Bad User Name or Password），然后断开
+- 只配置 `--username` 时，只校验用户名，密码可不带
+- 协议层拒绝“有 Password Flag 但没有 User Name Flag”的非法 CONNECT
+- 认证发生在会话查找和 Will 存储之前，认证失败的连接不会污染会话状态
+- 测试客户端也支持 `username` / `password` 参数
+
+### 3.14 CI 与运行指标
+
+- 新增 `.github/workflows/ci.yml`：
+  - `make` 构建
+  - 普通 pytest
+  - ASan/UBSan 构建 + 全量 pytest
+- 新增 `metrics.c/.h`，维护以下计数器：
+  - 连接 opened / closed
+  - 收到的 PUBLISH 数
+  - 发出的 PUBLISH 数
+  - 丢弃的消息数
+  - 读/写字节数
+- 统计行同时输出实时 gauge：
+  - 当前连接数、持久会话数、订阅数、retained 数
+  - inflight 总数、离线队列总数
+- 两种触发方式：
+  - `kill -USR1 <pid>` 立即输出一次
+  - `--stats-interval-ms N` 周期输出
+- 统计行格式示例：
+
+```text
+stats: conn_active=1 conn_accepted=2 conn_closed=1 sessions_persistent=0 subscriptions=1 retained=0 inflight=0 queued=0 messages_received=1 messages_sent=1 messages_dropped=0 bytes_in=31 bytes_out=17
+```
+
 ## 4. 代码结构
 
 ```text
 src/
 ├── main.c            # 启动参数、listen socket、epoll 事件循环、优雅退出
-├── config.c/.h       # 全局配置：资源上限、缓冲上限、重传间隔
+├── config.c/.h       # 全局配置：资源上限、缓冲上限、重传间隔、认证、统计
+├── metrics.c/.h      # 运行计数器与 stats 行
 ├── connection.c/.h   # 连接对象、读写缓冲、EPOLLOUT、连接生命周期
 ├── mqtt.c/.h         # 报文编解码、协议状态机、CONNECT/PUBLISH/SUBSCRIBE/PUBACK/Will
 ├── session.c/.h      # 会话表、clean session、inflight、入站 QoS2、离线队列
@@ -258,7 +298,9 @@ tests/
 ├── test_qos2.py
 ├── test_persistence.py
 ├── test_limits.py
-└── test_shutdown.py
+├── test_shutdown.py
+├── test_auth.py
+└── test_metrics.py
 ```
 
 ### 关键数据结构
@@ -303,11 +345,11 @@ make test            # 运行全部 pytest（使用 uv）
 ### 当前结果
 
 ```text
-collected 104 items
-104 passed in 41.06s
+collected 111 items
+111 passed in 41.81s
 ```
 
-没有 skipped 用例：Retained、Will、Keepalive、QoS2、持久化、资源上限、动态缓冲和优雅退出都有端到端测试。
+没有 skipped 用例：Retained、Will、Keepalive、QoS2、持久化、资源上限、动态缓冲、优雅退出、认证和指标都有端到端测试。
 
 ### 覆盖重点
 
@@ -328,6 +370,8 @@ collected 104 items
 - 会话/retained/订阅上限与 LRU 淘汰
 - 128KB 大 payload 的动态读写缓冲
 - SIGTERM 优雅退出、退出前 Will 发布
+- 用户名/密码认证：正确、错误密码、缺失凭据、仅用户名模式
+- 周期 stats 与 SIGUSR1 stats
 - 断连后订阅清理、二次 CONNECT、CONNECT 前 PING
 
 ### 额外验证
@@ -338,56 +382,57 @@ collected 104 items
 - 手工验证了：retained 替换/删除、Will Retain、Keepalive 超时触发 Will
 - 手工验证了：QoS2 重传、incoming/outgoing 状态跨重启、接管时 Will 发布
 - 手工验证了：128KB payload、三类资源上限、SIGTERM 发布 Will 并退出 0
+- 手工验证了：认证失败返回 4、stats 行计数正确
 
 ## 6. 已知限制
 
 1. **持久化是整文件快照**：每次状态变更都会重写整个状态文件并 `fsync`，状态大时写放大会明显；后续可改为 journal / 增量快照。
 2. **崩溃一致性是快照级，不是事务级**：极端情况下在 QoS2 PUBREL 处理中途崩溃，重启后可能出现重复投递或确认丢失；正常停机/重启路径已测试。
-3. **没有会话/retained 过期**：MQTT 3.1.1 本身没有 Session Expiry 和 retained 过期，离线会话与 retained 会一直保留到被 LRU 淘汰或手动清理。
-4. **有硬性缓冲上限**：默认读 1MiB、写 2MiB；超过上限的单包会被断开，可通过 CLI 调大，但不是无限支持。
-5. **队列和 inflight 仍固定为 1024**：每会话最多 1024 条 inflight、1024 条离线消息、1024 条入站 QoS2，满了会丢弃/断开并打日志。
-6. **Keepalive 是字节级计时**：收到任意字节都会刷新 `last_rx_ms`，不是严格的“完整控制包”级计时；扫描周期 200ms。
-7. **没有 CONNECT 超时**：客户端连上后一直不发 CONNECT 不会被主动清理。
-8. **Will / Retained 大 topic 限制**：实时转发路径仍使用 256 字节 topic 缓冲，超过该长度的 topic 在实时投递时会被丢弃（retained 新订阅路径不受此限制）。
-9. **优雅退出最多等 1 秒 flush**：对端极慢时，部分 Will/QoS 消息可能未发出；持久会话的 inflight 会在下次重连时重发。
-10. **无认证与加密**：username/password 只解析不校验，不支持 TLS；状态文件是明文。
-11. **没有 CI / 指标 / fuzz**：目前靠本地 pytest + ASan/UBSan，尚未接入自动化 CI 和运行指标。
-12. **状态文件无压缩/迁移**：格式升级需要手动兼容，旧版本状态文件可能被当作损坏文件清空。
+3. **认证是单账号静态配置**：只有一个用户名/密码，来自 CLI，凭据会出现在进程参数里；没有用户库、ACL、TLS。
+4. **没有 TLS**：目前仍是明文 TCP，状态文件也是明文。
+5. **指标只输出到日志**：还没有 Prometheus/HTTP 指标端点，也没有日志级别控制。
+6. **CI 仅覆盖 GitHub Actions**：本地没有统一 runner；fuzz 和崩溃注入尚未接入。
+7. **没有会话/retained 过期**：依赖 LRU 上限，没有时间过期。
+8. **有硬性缓冲上限**：默认读 1MiB、写 2MiB；超过上限的单包会被断开。
+9. **队列和 inflight 仍固定为 1024**：每会话最多 1024 条 inflight、1024 条离线消息、1024 条入站 QoS2。
+10. **Keepalive 是字节级计时**：收到任意字节都会刷新 `last_rx_ms`；扫描周期 200ms。
+11. **没有 CONNECT 超时**：客户端连上后一直不发 CONNECT 不会被主动清理。
+12. **Will / Retained 大 topic 限制**：实时转发路径仍使用 256 字节 topic 缓冲。
+13. **优雅退出最多等 1 秒 flush**：对端极慢时部分消息可能未发出；持久会话的 inflight 会在重连时重发。
+14. **状态文件无压缩/迁移**：格式升级需要手动兼容。
 
 ## 7. 下一阶段计划
 
-### P0：工程化收尾
+### P0：TLS 与安全
 
 | 任务 | 说明 | 验收标准 |
 | --- | --- | --- |
-| CI | `make` + pytest + sanitizer 在 CI 自动执行 | 每次提交自动跑 |
-| 日志与指标 | 连接数、订阅数、inflight、retained、丢弃计数，支持日志级别 | 可通过日志/指标观察运行状态 |
-| 持久化事务性 | 解决 QoS2 PUBREL 中途崩溃的重复/丢失窗口 | 崩溃注入测试通过 |
-| 状态文件演进 | 版本迁移、增量快照或 journal，降低写放大 | 大状态写入可接受 |
+| TLS 接入 | OpenSSL 非阻塞握手，支持 `--tls-cert/--tls-key` | TLS 客户端可连接，明文/密文可配置 |
+| 用户库/ACL | 从配置文件读取多用户与 topic 权限 | 不同用户订阅/发布权限可测试 |
+| 凭据安全 | 避免密码出现在进程参数，支持环境变量/文件 | 进程列表不暴露密码 |
 
-### P1：协议与运维能力
+### P1：持久化与可观测性
 
 | 任务 | 说明 | 验收标准 |
 | --- | --- | --- |
-| 认证/TLS | 用户名密码校验与 TLS 接入 | 可选启用 |
-| CONNECT 超时与大 topic | 半开连接回收；动态 topic 缓冲 | 长 topic/半开连接可测试 |
-| 队列上限配置化 | 把 inflight/离线队列/QoS2 表上限也纳入配置 | 不改代码即可调整 |
-| 配置文件中文化 | CLI 之外的配置文件支持 | 适合容器/服务化部署 |
+| 持久化事务性 | 处理 QoS2 PUBREL 中途崩溃的重复/丢失窗口 | 崩溃注入测试通过 |
+| 增量快照/journal | 降低整文件重写和 fsync 的写放大 | 大状态写入可接受 |
+| 日志级别 | error/warn/info/debug 可配置 | 生产环境可降低日志量 |
+| 指标导出 | HTTP `/metrics` 或 Prometheus 文本格式 | 可被监控系统抓取 |
 
 ### P2：健壮性验证
 
 | 任务 | 说明 | 验收标准 |
 | --- | --- | --- |
-| 模糊测试 | 固定头、Remaining Length、CONNECT/PUBLISH、状态文件 | 不崩溃、不越界 |
+| Fuzz | 固定头、Remaining Length、CONNECT/PUBLISH、状态文件 | 不崩溃、不越界 |
 | 崩溃注入 | 在 PUBREL/落盘关键点注入崩溃 | 状态可恢复或明确失败 |
 | 长稳测试 | 大量连接、订阅、retained 循环 | 内存/句柄不泄漏 |
-| 文档与示例 | 部署、配置、限制说明 | 新用户可独立跑通 |
 
 ## 8. 建议的推进顺序
 
-1. **先做 CI + 日志指标**：把已有 104 个测试和 sanitizer 固化成流水线。
-2. **再做持久化事务性与状态文件演进**：解决写放大和 QoS2 崩溃窗口。
-3. **然后做认证/TLS、CONNECT 超时、大 topic、队列上限配置化**。
+1. **先做 TLS**：把明文链路补齐为可选的 TLS。
+2. **再做持久化事务性与增量快照**：解决写放大和 QoS2 崩溃窗口。
+3. **然后做日志级别、指标导出、多用户/ACL**。
 4. **最后做 fuzz、崩溃注入、长稳测试**。
 
 ## 9. 里程碑
@@ -400,4 +445,5 @@ collected 104 items
 | M4 | Retained + Will + Keepalive | ✅ |
 | M5 | QoS 2 + 会话/Retained 磁盘持久化 | ✅ |
 | M6 | 资源上限、动态缓冲、优雅退出、CLI 配置 | ✅ |
-| M7 | CI、日志指标、认证/TLS、fuzz、持久化事务性 | ⏳ 下一步 |
+| M7 | CI、运行指标、用户名密码认证 | ✅ |
+| M8 | TLS、持久化事务性、日志级别、指标导出、fuzz | ⏳ 下一步 |
