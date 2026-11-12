@@ -254,7 +254,7 @@ int mqtt_decode_publish(const uint8_t *body, size_t body_len, uint8_t flags,
     return 1;
 }
 
-// ==== PUBLISH 编码（QoS 0/1 共用） ====
+// ==== PUBLISH 编码） ====
 static int mqtt_send_publish_packet(connection_t *c, const char *topic,
                                     size_t topic_len, const uint8_t *payload,
                                     size_t payload_len, uint8_t qos,
@@ -361,16 +361,16 @@ static void broker_publish(const char *topic, size_t topic_len,
 }
 
 void mqtt_publish_will(connection_t *c) {
-    if (!c || !c->will_topic || c->will_suppress ||
-        c->state != SESSION_STATE_CONNECTED)
+    if (!c || !c->will.topic || c->state != CONN_STATE_CONNECTED)
         return;
 
     printf("fd=%d publish Will topic='%.*s' qos=%u retain=%u\n", c->fd,
-           (int)c->will_topic_len, c->will_topic, c->will_qos,
-           c->will_retain);
-    c->will_suppress = 1; // 防止重复发布
-    broker_publish(c->will_topic, c->will_topic_len, c->will_payload,
-                   c->will_payload_len, c->will_qos, c->will_retain);
+           (int)c->will.topic_len, c->will.topic, c->will.qos,
+           c->will.retain);
+    broker_publish(c->will.topic, c->will.topic_len, c->will.payload,
+                   c->will.payload_len, c->will.qos, c->will.retain);
+    // 发布后立即释放，避免 shutdown / destroy 重复发布
+    connection_clear_will(c);
 }
 
 // ======== SUBSCRIBE / UNSUBSCRIBE ========
@@ -477,13 +477,6 @@ static void session_resume(session_t *s, connection_t *c) {
     session_flush_queue(s, c);
 }
 
-// 标记旧连接待回收：不立即 free，避免同一批 epoll 事件里出现悬空指针
-static void connection_mark_dead(connection_t *old) {
-    old->dead = 1;
-    old->want_close = 1;
-    epoll_ctl(g_epfd, EPOLL_CTL_DEL, old->fd, NULL);
-}
-
 // 把 CONNECT 中的 Will 复制到连接；失败返回 -1
 static int connection_store_will(connection_t *c,
                                  const mqtt_connect_t *mc) {
@@ -514,12 +507,12 @@ static int connection_store_will(connection_t *c,
     if (mc->will_payload_len)
         memcpy(payload, mc->will_payload, mc->will_payload_len);
 
-    c->will_topic = topic;
-    c->will_topic_len = mc->will_topic_len;
-    c->will_payload = payload;
-    c->will_payload_len = mc->will_payload_len;
-    c->will_qos = mc->will_qos;
-    c->will_retain = mc->will_retain;
+    c->will.topic = topic;
+    c->will.topic_len = mc->will_topic_len;
+    c->will.payload = payload;
+    c->will.payload_len = mc->will_payload_len;
+    c->will.qos = mc->will_qos;
+    c->will.retain = mc->will_retain;
     return 0;
 }
 
@@ -527,7 +520,7 @@ static int connection_store_will(connection_t *c,
 static int handle_connect(connection_t *c, const uint8_t *body,
                           size_t body_len) {
     // 状态检查：必须处于 CONNECTING
-    if (c->state != SESSION_STATE_CONNECTING) {
+    if (c->state != CONN_STATE_CONNECTING) {
         fprintf(stderr, "fd=%d protocol violation: CONNECT after CONNECT\n",
                 c->fd);
         return -1;
@@ -862,7 +855,7 @@ static int handle_disconnect(connection_t *c, const uint8_t *body,
     }
     printf("fd=%d DISCONNECT: client_id='%s' (clean exit)\n", c->fd,
            c->session ? c->session->client_id : "");
-    c->will_suppress = 1; // 正常断开不发布 Will
+    connection_clear_will(c); // 正常断开不发布 Will
     return -1;            // 关闭连接
 }
 
@@ -1061,7 +1054,7 @@ static bool fixed_header_flags_valid(uint8_t type, uint8_t flags) {
 static int dispatch_packet(connection_t *c, const mqtt_fixed_header_t *hdr,
                            const uint8_t *body, size_t body_len) {
     // ---- 状态机： CONNECTING 状态只允许 CONNECT ----
-    if (c->state == SESSION_STATE_CONNECTING) {
+    if (c->state == CONN_STATE_CONNECTING) {
         if (hdr->type != MQTT_CONNECT) {
             fprintf(stderr, "fd=%d protocol violation got %s before CONNECT\n",
                     c->fd, packet_type_name(hdr->type));
@@ -1104,7 +1097,7 @@ static int dispatch_packet(connection_t *c, const mqtt_fixed_header_t *hdr,
 void mqtt_retransmit_all(uint64_t now_ms) {
     for (session_t *s = session_first(); s; s = session_next(s)) {
         connection_t *c = s->conn;
-        if (!c || c->state != SESSION_STATE_CONNECTED || c->want_close ||
+        if (!c || c->state != CONN_STATE_CONNECTED || c->want_close ||
             c->dead)
             continue;
 

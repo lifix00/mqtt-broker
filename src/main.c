@@ -43,15 +43,17 @@ static void broker_shutdown(int listen_fd) {
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, listen_fd, NULL);
     close(listen_fd);
 
-    for (connection_t *c = connection_first(); c; c = connection_next(c)) {
-        if (c->state == SESSION_STATE_CONNECTED)
-            mqtt_publish_will(c);
-    }
+    // 是否真正发布由 mqtt_publish_will 判断：
+    // 只有 CONNECT 成功且 Will 尚未被正常 DISCONNECT 清除的连接才会发布。
+    for (connection_t *c = connection_first(); c; c = connection_next(c))
+        mqtt_publish_will(c);
 
     uint64_t deadline = connection_now_ms() + 1000;
     for (;;) {
         int pending = 0;
         for (connection_t *c = connection_first(); c; c = connection_next(c)) {
+            if (c->dead)
+                continue;
             if (c->wpos < c->wlen) {
                 if (connection_try_flush(c) < 0)
                     continue;
@@ -65,12 +67,9 @@ static void broker_shutdown(int listen_fd) {
         nanosleep(&ts, NULL);
     }
 
-    connection_t *c = connection_first();
-    while (c) {
-        connection_t *next = connection_next(c);
-        connection_destroy(c);
-        c = next;
-    }
+    for (connection_t *c = connection_first(); c; c = connection_next(c))
+        connection_mark_dead(c);
+    connection_reap_dead();
     persistence_save();
 }
 
@@ -102,38 +101,9 @@ static int create_listener(int port) {
     return fd;
 }
 
-// 处理一个连接上的 EPOLLIN：读到 EAGAIN，把数据累积到
-// rbuf，然后交给mqtt协议层解析
+// 处理一个连接上的 EPOLLIN：先读 socket，再解析已缓冲的 MQTT 报文
 static void handle_connection_read(connection_t *c) {
-    int peer_closed = 0;
-    int buf_full = 0;
-
-    for (;;) {
-        if (c->rlen == c->rcap) {
-            if (connection_grow_read(c) < 0) {
-                buf_full = 1;
-                break;
-            }
-        }
-        ssize_t n =
-            read(c->fd, c->rbuf + c->rlen, c->rcap - c->rlen);
-
-        if (n > 0) {
-            c->rlen += (size_t)n;
-            c->last_rx_ms = connection_now_ms();
-            metrics_bytes_in((size_t)n);
-        } else if (n == 0) {
-            peer_closed = 1;
-            break;
-        } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;
-            if (errno == EINTR)
-                continue;
-            perror("read");
-            goto close_conn;
-        }
-    }
+    connection_read_result_t rr = connection_read(c);
 
     int rc = mqtt_process(c);
     if (rc < 0 || c->want_close) {
@@ -142,18 +112,17 @@ static void handle_connection_read(connection_t *c) {
         goto close_conn;
     }
     // 扩容到上限后仍然塞满，且协议层也消费不出完整报文：放弃
-    if (buf_full && c->rlen == c->rcap) {
+    if (rr == CONN_READ_LIMIT && c->rlen == c->rcap) {
         fprintf(stderr, "fd=%d read buffer limit reached, closing\n", c->fd);
         goto close_conn;
     }
-    if (peer_closed)
+    if (rr == CONN_READ_EOF || rr == CONN_READ_ERROR)
         goto close_conn;
     return;
 
 close_conn:
     printf("fd=%d connection closed\n", c->fd);
-    epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
-    connection_destroy(c);
+    connection_mark_dead(c);
 }
 
 static int parse_long_option(const char *name, const char *value, long min,
@@ -338,6 +307,7 @@ int main(int argc, char *argv[]) {
                         close(client_fd);
                         continue;
                     }
+                    metrics_connection_opened();
 
                     char ip[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
@@ -349,11 +319,10 @@ int main(int argc, char *argv[]) {
                     cev.data.ptr = c;
                     if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, client_fd, &cev) < 0) {
                         perror("epoll_ctl ADD client");
-                        connection_destroy(c);
+                        connection_mark_dead(c);
                         continue;
                     }
                     c->epoll_events = EPOLLIN;
-                    metrics_connection_opened();
                 }
                 continue;
             }
@@ -361,7 +330,7 @@ int main(int argc, char *argv[]) {
             // ---- 普通连接 ----
             connection_t *c = (connection_t *)ptr;
             if (c->dead)
-                continue; // 已被新连接接管，等本轮事件处理完统一回收
+                continue; // 已标记立即关闭，等本批事件处理完统一回收
 
             // 先读完可读数据，避免 DISCONNECT 和 EOF/HUP 同时到达时
             // 直接按异常断开处理，错误地发布 Will
@@ -372,21 +341,18 @@ int main(int argc, char *argv[]) {
 
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                 printf("fd=%d error/hup, closing\n", c->fd);
-                epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
-                connection_destroy(c);
+                connection_mark_dead(c);
                 continue;
             }
 
             if (events[i].events & EPOLLOUT) {
                 if (connection_try_flush(c) < 0) {
-                    epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
-                    connection_destroy(c);
+                    connection_mark_dead(c);
                     continue;
                 }
                 if (c->want_close && c->wpos == c->wlen) {
                     printf("fd=%d connection closed (graceful)\n", c->fd);
-                    epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
-                    connection_destroy(c);
+                    connection_mark_dead(c);
                 }
             }
         }

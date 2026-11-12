@@ -107,7 +107,7 @@ int mqtt_send_publish_qos2(connection_t *c, const char *topic, size_t topic_len,
 // 扫描所有连接，把超时未收到 PUBACK 的 QoS1 消息以 DUP=1 重发
 void mqtt_retransmit_all(uint64_t now_ms);
 
-// 连接异常关闭时发布 Will 消息（正常 DISCONNECT 由调用方设置 will_suppress）
+// 连接异常关闭时发布 Will 消息（正常 DISCONNECT 会先清除 Will）
 void mqtt_publish_will(connection_t *c);
 
 // ==== SUBSCRIBE / SUBACK ====
@@ -120,6 +120,7 @@ void mqtt_publish_will(connection_t *c);
 #define MQTT_SUBACK_FAILURE 0x80
 
 
+// 解析 rbuf 中已缓冲的完整 MQTT 报文并分派；不执行 socket read
 int mqtt_process(connection_t *c);
 
 #endif

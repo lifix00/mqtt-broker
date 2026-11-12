@@ -103,7 +103,7 @@ session_t *session_create(const char *client_id, uint8_t clean_session,
 void session_attach(session_t *s, connection_t *c) {
     s->conn = c;
     c->session = s;
-    c->state = SESSION_STATE_CONNECTED;
+    c->state = CONN_STATE_CONNECTED;
     session_touch(s);
     persistence_save();
 }
@@ -114,7 +114,7 @@ void session_detach(session_t *s) {
     connection_t *c = s->conn;
     s->conn = NULL;
     c->session = NULL;
-    c->state = SESSION_STATE_CONNECTING;
+    c->state = CONN_STATE_CONNECTING;
     session_touch(s);
 }
 

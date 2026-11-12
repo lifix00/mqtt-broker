@@ -3,7 +3,6 @@
 #include "metrics.h"
 #include "mqtt.h"
 #include "session.h"
-#include "subscription.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -44,7 +43,7 @@ connection_t *connection_create(int fd) {
     c->wcap = INIT_WRITE_BUF_SIZE;
     c->epoll_events = 0;
     c->session = NULL;
-    c->state = SESSION_STATE_CONNECTING;
+    c->state = CONN_STATE_CONNECTING;
     c->keep_alive = 0;
     c->last_rx_ms = connection_now_ms();
     c->dead = 0;
@@ -63,6 +62,14 @@ connection_t *connection_first(void) { return g_connections; }
 
 connection_t *connection_next(connection_t *c) { return c ? c->next : NULL; }
 
+void connection_clear_will(connection_t *c) {
+    if (!c)
+        return;
+    free(c->will.topic);
+    free(c->will.payload);
+    memset(&c->will, 0, sizeof(c->will));
+}
+
 void connection_request_close(connection_t *c) {
     if (c->want_close)
         return;
@@ -71,7 +78,7 @@ void connection_request_close(connection_t *c) {
     connection_try_flush(c);
 }
 
-void connection_destroy(connection_t *c) {
+static void connection_destroy(connection_t *c) {
     if (!c)
         return;
 
@@ -92,11 +99,10 @@ void connection_destroy(connection_t *c) {
             session_destroy(s);
     }
 
-    // 异常断开时发布 Will；正常 DISCONNECT 已把 will_suppress 置 1
+    // 异常断开时发布 Will；正常 DISCONNECT 已提前 clear
     mqtt_publish_will(c);
+    connection_clear_will(c);
 
-    free(c->will_topic);
-    free(c->will_payload);
     free(c->rbuf);
     free(c->wbuf);
     close(c->fd);
@@ -104,8 +110,15 @@ void connection_destroy(connection_t *c) {
     metrics_connection_closed();
 }
 
-// 处理完一批 epoll 事件后，统一回收被接管的旧连接。
-// 这样即使旧连接的事件还在同一批 events[] 里，也不会访问已释放内存。
+void connection_mark_dead(connection_t *c) {
+    if (!c || c->dead)
+        return;
+    c->dead = 1;
+    epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+}
+
+// 处理完一批 epoll 事件后，统一回收所有 dead 连接。
+// 这样即使同一批 events[] 里还有该连接的后续事件，也不会访问已释放内存。
 void connection_reap_dead(void) {
     connection_t *c = g_connections;
     while (c) {
@@ -116,9 +129,10 @@ void connection_reap_dead(void) {
     }
 }
 
+
 void connection_check_keepalive(uint64_t now_ms) {
     for (connection_t *c = g_connections; c; c = c->next) {
-        if (c->dead || c->state != SESSION_STATE_CONNECTED ||
+        if (c->dead || c->state != CONN_STATE_CONNECTED ||
             c->keep_alive == 0)
             continue;
 
@@ -127,9 +141,7 @@ void connection_check_keepalive(uint64_t now_ms) {
         if (now_ms - c->last_rx_ms > limit) {
             printf("fd=%d keepalive timeout after %u s\n", c->fd,
                    c->keep_alive);
-            c->dead = 1;
-            c->want_close = 1;
-            epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+            connection_mark_dead(c);
         }
     }
 }
@@ -188,9 +200,36 @@ static int connection_ensure_write(connection_t *c, size_t extra) {
     return 0;
 }
 
+connection_read_result_t connection_read(connection_t *c) {
+    for (;;) {
+        if (c->rlen == c->rcap) {
+            if (connection_grow_read(c) < 0)
+                return CONN_READ_LIMIT;
+        }
+
+        ssize_t n = read(c->fd, c->rbuf + c->rlen, c->rcap - c->rlen);
+        if (n > 0) {
+            c->rlen += (size_t)n;
+            c->last_rx_ms = connection_now_ms();
+            metrics_bytes_in((size_t)n);
+        } else if (n == 0) {
+            return CONN_READ_EOF;
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return CONN_READ_OK;
+            if (errno == EINTR)
+                continue;
+            perror("read");
+            return CONN_READ_ERROR;
+        }
+    }
+}
+
 int connection_get_fd(connection_t *c) { return c->fd; }
 
-// 根据 wbuf 是否有未发送的数据，动态注册/取消 EPOLLOUT
+// 自动根据 wbuf 是否有未发送的数据，动态注册/取消 EPOLLOUT
+// 如果写缓冲区中有未发送的数据，要修改注册这个连接绑定EPOLLIN | EPOLLOUT，让内核通知可以发送;
+// 如果写缓冲区中无未发送的数据，要修改注册这个连接绑定EPOLLIN，就算可以发数据也不要通知。
 void connection_update_events(connection_t *c) {
     uint32_t ev = EPOLLIN;
     if (c->wpos < c->wlen) {

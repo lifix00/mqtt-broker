@@ -12,17 +12,15 @@
 struct connection;
 typedef struct connection connection_t;
 
-typedef enum {
-    SESSION_STATE_CONNECTING = 0,
-    SESSION_STATE_CONNECTED,
-} session_state_t;
-
-// 出站消息当前处于 QoS1/QoS2 握手的哪个阶段
-typedef enum {
+// 出站消息当前处于 QoS1/QoS2 握手的哪个阶段。
+// 状态实际存放在 inflight_entry_t.state（uint8_t）里：
+// 每个会话最多 1024 条 inflight，用 uint8_t 而不是 enum 可以省内存，
+// 也正好对应持久化文件里的 1 字节状态。
+enum {
     INFLIGHT_WAIT_PUBACK = 0,  // QoS1：等待 PUBACK
     INFLIGHT_WAIT_PUBREC,      // QoS2：已发 PUBLISH，等待 PUBREC
     INFLIGHT_WAIT_PUBCOMP,     // QoS2：已发 PUBREL，等待 PUBCOMP
-} inflight_state_t;
+};
 
 // 一条已发送、等待确认的 QoS1/QoS2 消息
 typedef struct inflight_entry {
