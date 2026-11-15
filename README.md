@@ -60,8 +60,11 @@ make
 | --- | --- |
 | 20k 订阅 / 2k 消息匹配 | 约 1.8s → 0.01s（**150×**） |
 | QoS1 + 持久化 | 约 0.7 万 → 5.3 万 msg/s（**7×**） |
-| QoS1 并发（vs Mosquitto 2.0.21） | 10–50 client 为 **1.15–1.45×** |
-| 连接建立（vs Mosquitto 2.0.21） | 约 **1.5×** |
+| QoS1 64B（vs Mosquitto 2.0.21） | 1–100 client，**持平至 +45%** |
+| QoS2 64B（vs Mosquitto 2.0.21） | 1–50 client，0.95–1.09× |
+| QoS0 64B（vs Mosquitto 2.0.21） | 1–100 client，0.86–0.92× |
+| QoS0 1KB（vs Mosquitto 2.0.21） | 10–100 client，0.24–0.50×（已知短板） |
+| fanout 100 订阅者 × 1000 条 | 约 1.00× |
 
 > 以上为本地相对基准，受机器负载影响；不是生产容量承诺。  
 > 持久化数字的测试口径：1 发布 / 1 订阅、64B payload、1000 条 QoS1 突发、state 位于 `/tmp`（tmpfs）、`-O0` 构建；不是 Mosquitto 对比项。
