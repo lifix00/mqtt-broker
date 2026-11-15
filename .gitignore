@@ -15,3 +15,7 @@ mqtt-broker
 
 # Broker state file
 mqtt-broker.state*
+
+# Local Markdown notes; publish only the root README
+*.md
+!/README.md

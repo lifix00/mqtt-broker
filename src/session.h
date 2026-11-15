@@ -12,6 +12,8 @@
 struct connection;
 typedef struct connection connection_t;
 
+struct subscription;
+
 // 出站消息当前处于 QoS1/QoS2 握手的哪个阶段。
 // 状态实际存放在 inflight_entry_t.state（uint8_t）里：
 // 每个会话最多 1024 条 inflight，用 uint8_t 而不是 enum 可以省内存，
@@ -29,7 +31,9 @@ typedef struct inflight_entry {
     uint8_t  qos;
     uint8_t  state;
     uint8_t  retain;
-    uint64_t sent_at_ms; // 上次发送时间，用于超时重传
+    uint64_t last_sent_ms;   // 上次发送时间，用于重传间隔
+    uint64_t first_sent_ms;  // 首次发送时间，用于 ACK 超时
+    uint32_t retry_count;    // 已重传次数，用于最大重试出口
 
     // 保存消息副本，PUBACK 丢失或重连时才能重传
     char    *topic;
@@ -80,7 +84,13 @@ typedef struct session {
     incoming_qos2_entry_t incoming_qos2[MAX_INCOMING_QOS2];
     int incoming_qos2_count;
 
+    // 订阅归属于会话，由 subscription.c 维护这两个字段：
+    // subscriptions 是该会话的订阅链表头，subscription_count 用于 O(1) 上限检查。
+    struct subscription *subscriptions;
+    size_t subscription_count;
+
     uint64_t last_active_seq; // LRU 淘汰用（单调递增序号）
+    uint64_t offline_since_ms; // 离线起始时间（wall clock），0 = 在线
 
     struct session *hash_next; // 会话表桶内链
 } session_t;
@@ -94,12 +104,17 @@ void session_destroy(session_t *s);
 
 void session_attach(session_t *s, connection_t *c);
 void session_detach(session_t *s);
+void session_mark_offline(session_t *s);
 
 session_t *session_first(void);
 session_t *session_next(session_t *s);
 void session_clear_all(void);
 void session_touch(session_t *s);
 int session_persistent_count(void);
+
+// 会话过期：wall clock 毫秒，供持久化和离线扫描使用
+uint64_t session_wall_now_ms(void);
+void session_expire_offline(uint64_t now_ms);
 
 // ==== 出站 QoS1：packet id 与 inflight ====
 uint16_t session_alloc_packet_id(session_t *s);

@@ -60,6 +60,27 @@ def _expect_match(sub, pub, filter_topic, pub_topic, should_match):
         # 混合
         ("a/+/c/#", "a/b/c/d/e", True),
         ("a/+/c/#", "a/b/x/d", False),
+        # 根层通配符
+        ("#", "a", True),
+        ("#", "a/b/c", True),
+        ("+/+", "a/b", True),
+        ("+/+", "a", False),
+        ("+/+", "a/", True),
+        ("+/+", "/b", True),
+        # '+' 后面接 '#'
+        ("a/+/#", "a/b", True),
+        ("a/+/#", "a", False),
+        ("a/+/#", "a/b/c", True),
+        # 尾层为空
+        ("a/+", "a/", True),
+        ("a/+", "a", False),
+        ("a/", "a/", True),
+        ("a/", "a", False),
+        # 首层为空 / 中间空层
+        ("/a", "/a", True),
+        ("/a", "a", False),
+        ("a//b", "a//b", True),
+        ("a//b", "a/b", False),
     ],
 )
 def test_wildcard(pair, filter_topic, pub_topic, should_match):

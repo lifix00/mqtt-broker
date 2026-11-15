@@ -1,5 +1,6 @@
 """最小 MQTT 3.1.1 客户端封装，仅用于测试。"""
 import socket
+import ssl
 import struct
 from enum import IntEnum
 
@@ -84,6 +85,7 @@ class MQTTClient:
         will_retain: bool = False,
         username: str | None = None,
         password: str | None = None,
+        tls: bool = False,
     ):
         if not clean_session and not client_id:
             raise ValueError("client_id must be non-empty when clean_session=False")
@@ -98,6 +100,14 @@ class MQTTClient:
             raise ValueError("password requires username")
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
+        self.tls = tls
+        if tls:
+            # 测试用自签名证书：只加密，不校验证书链。
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self.sock = ctx.wrap_socket(self.sock, server_hostname=host)
+            self.sock.settimeout(timeout)
         self.client_id = client_id
         self.clean_session = clean_session
         self.keep_alive = keep_alive

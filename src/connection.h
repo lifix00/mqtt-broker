@@ -8,6 +8,9 @@
 
 #define INIT_READ_BUF_SIZE  4096
 #define INIT_WRITE_BUF_SIZE 4096
+#define MAX_USERNAME_LEN    128
+
+struct ssl_st;
 
 // MQTT 连接协议状态：CONNECT 是否已经成功处理
 typedef enum {
@@ -28,6 +31,12 @@ typedef struct {
 typedef struct connection {
     int fd;
 
+    // TLS：ssl 为 NULL 表示明文；握手完成后才处理 MQTT
+    struct ssl_st *ssl;
+    int tls_handshake_done;
+    int tls_want_write; // 握手/SSL_write 当前需要可写事件
+    int tls_read_wants_write; // SSL_read 遇到重协商/KeyUpdate，需要先写
+
     char *rbuf;
     size_t rlen; // buf 中已有字节个数
     size_t rcap; // rbuf 容量
@@ -40,6 +49,9 @@ typedef struct connection {
 
     session_t *session;      // CONNECT 成功后指向会话；离线会话由会话表持有
     connection_state_t state; // MQTT CONNECT 握手状态
+
+    // CONNECT 成功后确定的授权身份；未启用认证时为 "anonymous"
+    char username[MAX_USERNAME_LEN];
 
     // 当前连接的 Keep Alive（秒），0 表示关闭
     uint16_t keep_alive;
@@ -55,6 +67,11 @@ typedef struct connection {
     int dead;          // 已被新连接接管，等本轮事件处理完再回收
     int want_close;    // flush完再关闭
 } connection_t;
+
+// TLS 初始化/清理；cert/key 都为空表示明文
+int connection_tls_init(const char *cert, const char *key);
+void connection_tls_cleanup(void);
+int connection_tls_enabled(void);
 
 connection_t *connection_create(int fd);
 int connection_get_fd(connection_t *c);

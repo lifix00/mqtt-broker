@@ -1,3 +1,4 @@
+#include "acl.h"
 #include "config.h"
 #include "metrics.h"
 #include "mqtt.h"
@@ -454,16 +455,21 @@ static void session_resume(session_t *s, connection_t *c) {
         if (!e->in_use)
             continue;
 
+        // 新连接上重新开始计算 ACK 超时和重试次数；
+        // 离线期间不把旧连接上的等待时间算到新连接头上。
+        e->first_sent_ms = now;
+        e->retry_count = 0;
+
         if (e->qos == 2 && e->state == INFLIGHT_WAIT_PUBCOMP) {
             // 已经进入 PUBREL 阶段，重连后重发 PUBREL
             if (send_pubrel(c, e->packet_id) == 0)
-                e->sent_at_ms = now;
+                e->last_sent_ms = now;
         } else if (mqtt_send_publish_packet(c, e->topic, e->topic_len,
                                             e->payload, e->payload_len, e->qos,
                                             e->retain, 1,
                                             e->packet_id) == 0) {
             // QoS1 或 QoS2 的 PUBLISH 阶段：DUP=1 重发
-            e->sent_at_ms = now;
+            e->last_sent_ms = now;
         }
     }
 
@@ -562,6 +568,21 @@ static int handle_connect(connection_t *c, const uint8_t *body,
         }
     }
 
+    // 授权身份：启用认证时用配置的用户；未启用认证时一律视为 anonymous，
+    // 不信任 CONNECT 里客户端自报的 username，避免 ACL 被冒充。
+    const char *identity = g_config.auth_username ? g_config.auth_username
+                                                   : "anonymous";
+    snprintf(c->username, sizeof(c->username), "%s", identity);
+
+    // Will 本质上是发布，CONNECT 阶段先做写权限检查。
+    if (mc.has_will &&
+        !acl_check_publish(c->username, mc.will_topic, mc.will_topic_len)) {
+        fprintf(stderr, "fd=%d Will topic denied\n", c->fd);
+        send_connack(c, 0, MQTT_CONNACK_NOT_AUTHORIZED);
+        connection_request_close(c);
+        return -1;
+    }
+
     // Client ID 校验
     if (mc.client_id_len == 0 && !mc.clean_session) {
         fprintf(stderr, "fd=%d empty client id with clean_session=0\n", c->fd);
@@ -652,6 +673,12 @@ static int handle_publish(connection_t *c, const uint8_t *body, size_t body_len,
     int rc = mqtt_decode_publish(body, body_len, flags, &p);
     if (rc <= 0) {
         fprintf(stderr, "fd=%d malformed PUBLISH\n", c->fd);
+        return -1;
+    }
+
+    if (!acl_check_publish(c->username, p.topic, p.topic_len)) {
+        fprintf(stderr, "fd=%d PUBLISH denied topic='%.*s'\n", c->fd,
+                (int)p.topic_len, p.topic);
         return -1;
     }
 
@@ -760,7 +787,7 @@ static int handle_pubrec(connection_t *c, const uint8_t *body,
 
     if (e->state != INFLIGHT_WAIT_PUBCOMP) {
         e->state = INFLIGHT_WAIT_PUBCOMP;
-        e->sent_at_ms = connection_now_ms();
+        e->last_sent_ms = connection_now_ms();
         persistence_save();
     }
     if (send_pubrel(c, packet_id) < 0)
@@ -915,6 +942,13 @@ static int handle_subscribe(connection_t *c, const uint8_t *body,
         }
         memcpy(filter_buf, filter, filter_len);
         filter_buf[filter_len] = '\0';
+
+        if (!acl_check_subscribe(c->username, filter_buf)) {
+            fprintf(stderr, "fd=%d SUBSCRIBE denied '%s'\n", c->fd,
+                    filter_buf);
+            codes[n++] = MQTT_SUBACK_FAILURE;
+            continue;
+        }
 
         uint8_t granted_qos = req_qos; // 已支持 QoS 0/1/2
         if (subscription_add(c->session, filter_buf, granted_qos) < 0) {
@@ -1093,6 +1127,24 @@ static int dispatch_packet(connection_t *c, const mqtt_fixed_header_t *hdr,
     }
 }
 
+// 判断一条 inflight 是否应该放弃。
+// first_sent_ms 在首次发送/重连时设置，不会随重传刷新。
+static int inflight_should_drop(const inflight_entry_t *e, uint64_t now_ms,
+                                const char **reason) {
+    if (g_config.inflight_timeout_ms > 0 &&
+        now_ms - e->first_sent_ms >=
+            (uint64_t)g_config.inflight_timeout_ms) {
+        *reason = "timeout";
+        return 1;
+    }
+    if (g_config.max_inflight_retries > 0 &&
+        e->retry_count >= (uint32_t)g_config.max_inflight_retries) {
+        *reason = "retry limit";
+        return 1;
+    }
+    return 0;
+}
+
 // 遍历所有会话，重传超时未确认的 QoS1 消息，并补发离线队列
 void mqtt_retransmit_all(uint64_t now_ms) {
     for (session_t *s = session_first(); s; s = session_next(s)) {
@@ -1105,13 +1157,26 @@ void mqtt_retransmit_all(uint64_t now_ms) {
             inflight_entry_t *e = &s->inflight[i];
             if (!e->in_use)
                 continue;
-            if (now_ms - e->sent_at_ms < (uint64_t)g_config.qos_retry_ms)
+
+            const char *reason = NULL;
+            if (inflight_should_drop(e, now_ms, &reason)) {
+                // 不删除 inflight：QoS1/QoS2 的事务状态要留给重连恢复。
+                // 关闭当前连接；clean session 会随连接销毁，持久会话会保留。
+                printf("fd=%d inflight mid=%u qos=%u %s, closing connection "
+                       "and keeping state (retries=%u)\n",
+                       c->fd, e->packet_id, e->qos, reason, e->retry_count);
+                connection_mark_dead(c);
+                break;
+            }
+
+            if (now_ms - e->last_sent_ms < (uint64_t)g_config.qos_retry_ms)
                 continue;
 
             if (e->qos == 2 && e->state == INFLIGHT_WAIT_PUBCOMP) {
                 // 已进入 PUBREL 阶段：重发 PUBREL，而不是 PUBLISH
                 if (send_pubrel(c, e->packet_id) == 0) {
-                    e->sent_at_ms = now_ms;
+                    e->last_sent_ms = now_ms;
+                    e->retry_count++;
                     printf("fd=%d retransmit PUBREL mid=%u\n", c->fd,
                            e->packet_id);
                 }
@@ -1122,14 +1187,15 @@ void mqtt_retransmit_all(uint64_t now_ms) {
             if (mqtt_send_publish_packet(c, e->topic, e->topic_len, e->payload,
                                          e->payload_len, e->qos, e->retain, 1,
                                          e->packet_id) == 0) {
-                e->sent_at_ms = now_ms;
+                e->last_sent_ms = now_ms;
+                e->retry_count++;
                 printf("fd=%d retransmit PUBLISH mid=%u qos=%u (DUP=1)\n",
                        c->fd, e->packet_id, e->qos);
             }
             // 发送失败（写缓冲满）就保持旧时间，下一轮再试
         }
 
-        if (s->queue_head)
+        if (!c->dead && s->queue_head)
             session_flush_queue(s, c);
     }
 }

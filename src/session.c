@@ -7,11 +7,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define SESSION_BUCKET_COUNT 64
 
 static session_t *g_buckets[SESSION_BUCKET_COUNT];
 static uint64_t g_session_seq = 0;
+
+uint64_t session_wall_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 static unsigned session_hash(const char *client_id) {
     unsigned h = 5381;
@@ -104,8 +111,16 @@ void session_attach(session_t *s, connection_t *c) {
     s->conn = c;
     c->session = s;
     c->state = CONN_STATE_CONNECTED;
+    s->offline_since_ms = 0;
     session_touch(s);
     persistence_save();
+}
+
+void session_mark_offline(session_t *s) {
+    if (!s || s->conn)
+        return;
+    s->offline_since_ms = session_wall_now_ms();
+    session_touch(s);
 }
 
 void session_detach(session_t *s) {
@@ -115,7 +130,7 @@ void session_detach(session_t *s) {
     s->conn = NULL;
     c->session = NULL;
     c->state = CONN_STATE_CONNECTING;
-    session_touch(s);
+    session_mark_offline(s);
 }
 
 void session_destroy(session_t *s) {
@@ -168,6 +183,27 @@ void session_clear_all(void) {
     while (s) {
         session_t *next = session_next(s);
         session_destroy(s);
+        s = next;
+    }
+}
+
+void session_expire_offline(uint64_t now_ms) {
+    if (g_config.session_expiry_ms <= 0)
+        return;
+
+    uint64_t ttl = (uint64_t)g_config.session_expiry_ms;
+    session_t *s = session_first();
+    while (s) {
+        // session_destroy() 会释放 s，先算好 next
+        session_t *next = session_next(s);
+        if (!s->clean_session && !s->conn && s->offline_since_ms != 0 &&
+            now_ms >= s->offline_since_ms &&
+            now_ms - s->offline_since_ms >= ttl) {
+            printf("expire offline session '%s' (offline %llu ms)\n",
+                   s->client_id,
+                   (unsigned long long)(now_ms - s->offline_since_ms));
+            session_destroy(s);
+        }
         s = next;
     }
 }
@@ -233,9 +269,12 @@ inflight_entry_t *session_inflight_add(session_t *s, uint16_t packet_id,
     slot->packet_id = packet_id;
     slot->in_use = 1;
     slot->qos = qos;
+    // QoS1 等 PUBACK；QoS2 先等 PUBREC，收到 PUBREC 后转 WAIT_PUBCOMP。
     slot->state = (qos == 2) ? INFLIGHT_WAIT_PUBREC : INFLIGHT_WAIT_PUBACK;
     slot->retain = retain;
-    slot->sent_at_ms = connection_now_ms();
+    slot->last_sent_ms = connection_now_ms();
+    slot->first_sent_ms = slot->last_sent_ms;
+    slot->retry_count = 0;
     slot->topic = topic_copy;
     slot->topic_len = topic_len;
     slot->payload = payload_copy;

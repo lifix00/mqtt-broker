@@ -1,0 +1,54 @@
+{
+  "ours": {
+    "q2-c1": {
+      "throughput": 15792.671783365984,
+      "mean_ms": 0.06236572899999998,
+      "max_ms": 0.319579,
+      "min_ms": 0.042095,
+      "successes": 1000,
+      "failures": 0
+    },
+    "q2-c10": {
+      "throughput": 58732.63340636071,
+      "mean_ms": 0.1660449739,
+      "max_ms": 3.1979550000000003,
+      "min_ms": 0.043226999999999995,
+      "successes": 10000,
+      "failures": 0
+    },
+    "q2-c50": {
+      "throughput": 55149.84382981578,
+      "mean_ms": 0.8905183943400001,
+      "max_ms": 6.595595,
+      "min_ms": 0.045018,
+      "successes": 50000,
+      "failures": 0
+    }
+  },
+  "mosquitto": {
+    "q2-c1": {
+      "throughput": 14793.714813334238,
+      "mean_ms": 0.06667252799999998,
+      "max_ms": 0.427174,
+      "min_ms": 0.04498,
+      "successes": 1000,
+      "failures": 0
+    },
+    "q2-c10": {
+      "throughput": 53913.0501541029,
+      "mean_ms": 0.17861483039999995,
+      "max_ms": 1.779563,
+      "min_ms": 0.045583,
+      "successes": 10000,
+      "failures": 0
+    },
+    "q2-c50": {
+      "throughput": 57946.291279280646,
+      "mean_ms": 0.8485761901599999,
+      "max_ms": 6.634761,
+      "min_ms": 0.048308,
+      "successes": 50000,
+      "failures": 0
+    }
+  }
+}

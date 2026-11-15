@@ -1,0 +1,12 @@
+{
+  "ours": {
+    "fanout": {
+      "throughput": 305121.44917843107
+    }
+  },
+  "mosquitto": {
+    "fanout": {
+      "throughput": 306422.39052141586
+    }
+  }
+}
