@@ -358,6 +358,9 @@ static void broker_publish(const char *topic, size_t topic_len,
                     (int)topic_len, topic);
         }
     }
+    // 没有订阅者时不需要走 trie；QoS0 消息直接丢弃，QoS1/2 仍由调用方回 ACK。
+    if (subscription_count() == 0)
+        return;
     subscription_deliver(topic, topic_len, payload, payload_len, qos, 0);
 }
 
@@ -676,7 +679,7 @@ static int handle_publish(connection_t *c, const uint8_t *body, size_t body_len,
         return -1;
     }
 
-    if (!acl_check_publish(c->username, p.topic, p.topic_len)) {
+    if (acl_enabled() && !acl_check_publish(c->username, p.topic, p.topic_len)) {
         fprintf(stderr, "fd=%d PUBLISH denied topic='%.*s'\n", c->fd,
                 (int)p.topic_len, p.topic);
         return -1;

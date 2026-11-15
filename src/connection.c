@@ -365,8 +365,17 @@ connection_read_result_t connection_read(connection_t *c) {
         // 读缓冲末尾没有空间时，先把未消费的前缀搬走；只有搬完仍满才扩容。
         if (c->rlen == c->rcap) {
             connection_compact_read(c);
-            if (c->rlen == c->rcap && connection_grow_read(c) < 0)
-                return CONN_READ_LIMIT;
+            if (c->rlen == c->rcap) {
+                // 缓冲里如果已经有一条完整报文，先返回让主循环解析，
+                // 不要因为“读得太快”而继续扩容。
+                mqtt_fixed_header_t hdr;
+                int hr = mqtt_decode_fixed_header(
+                    (const uint8_t *)c->rbuf, c->rlen, &hdr);
+                if (hr > 0 && hdr.total_len <= c->rlen)
+                    return CONN_READ_OK;
+                if (connection_grow_read(c) < 0)
+                    return CONN_READ_LIMIT;
+            }
         }
 
         ssize_t n;
