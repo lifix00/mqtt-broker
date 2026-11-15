@@ -14,6 +14,10 @@
 #include <time.h>
 #include <unistd.h>
 
+// 单次 EPOLLIN 最多读几轮，避免持续有数据时把读缓冲撑到上限；
+// 剩余数据由 level-triggered epoll 下一轮继续处理。
+#define MAX_READS_PER_CALL 4
+
 // 所有活跃连接，供定时任务遍历
 static connection_t *g_connections = NULL;
 
@@ -117,6 +121,7 @@ connection_t *connection_create(int fd) {
     }
 
     c->fd = fd;
+    c->rpos = 0;
     c->rlen = 0;
     c->rcap = INIT_READ_BUF_SIZE;
     c->wlen = 0;
@@ -256,6 +261,16 @@ void connection_check_keepalive(uint64_t now_ms) {
 
 // ==== 动态缓冲 ====
 
+static void connection_compact_read(connection_t *c) {
+    if (c->rpos == 0)
+        return;
+    size_t avail = c->rlen - c->rpos;
+    if (avail > 0)
+        memmove(c->rbuf, c->rbuf + c->rpos, avail);
+    c->rlen = avail;
+    c->rpos = 0;
+}
+
 int connection_grow_read(connection_t *c) {
     size_t max = g_config.max_read_buffer;
     if (c->rcap >= max)
@@ -346,9 +361,11 @@ connection_read_result_t connection_read(connection_t *c) {
             return CONN_READ_OK;
     }
 
-    for (;;) {
+    for (int reads = 0; reads < MAX_READS_PER_CALL; reads++) {
+        // 读缓冲末尾没有空间时，先把未消费的前缀搬走；只有搬完仍满才扩容。
         if (c->rlen == c->rcap) {
-            if (connection_grow_read(c) < 0)
+            connection_compact_read(c);
+            if (c->rlen == c->rcap && connection_grow_read(c) < 0)
                 return CONN_READ_LIMIT;
         }
 
@@ -402,6 +419,7 @@ connection_read_result_t connection_read(connection_t *c) {
         c->last_rx_ms = connection_now_ms();
         metrics_bytes_in((size_t)n);
     }
+    return CONN_READ_OK;
 }
 
 int connection_get_fd(connection_t *c) { return c->fd; }

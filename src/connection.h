@@ -38,7 +38,8 @@ typedef struct connection {
     int tls_read_wants_write; // SSL_read 遇到重协商/KeyUpdate，需要先写
 
     char *rbuf;
-    size_t rlen; // buf 中已有字节个数
+    size_t rpos; // 未消费数据的起始偏移
+    size_t rlen; // 有效数据结束位置
     size_t rcap; // rbuf 容量
 
     char *wbuf;

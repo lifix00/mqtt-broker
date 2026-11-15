@@ -1058,17 +1058,6 @@ static const char *packet_type_name(uint8_t type) {
     }
 }
 
-// 从 rbuf 里把已消费的头部字节挪掉
-// consumed = 从 rbuf 开头要丢弃的字节数
-static void rbuf_consume(connection_t *c, size_t consumed) {
-    if (consumed >= c->rlen) {
-        c->rlen = 0;
-        return;
-    }
-    memmove(c->rbuf, c->rbuf + consumed, c->rlen - consumed);
-    c->rlen -= consumed;
-}
-
 // 校验固定头 flags
 static bool fixed_header_flags_valid(uint8_t type, uint8_t flags) {
     switch (type) {
@@ -1202,13 +1191,17 @@ void mqtt_retransmit_all(uint64_t now_ms) {
 
 int mqtt_process(connection_t *c) {
     for (;;) {
-        if (c->rlen == 0)
+        size_t avail = c->rlen - c->rpos;
+        if (avail == 0) {
+            c->rpos = 0;
+            c->rlen = 0;
             return 0;
+        }
 
         // 1. 固定头解包
+        const uint8_t *buf = (const uint8_t *)c->rbuf + c->rpos;
         mqtt_fixed_header_t hdr;
-        int rc =
-            mqtt_decode_fixed_header((const uint8_t *)c->rbuf, c->rlen, &hdr);
+        int rc = mqtt_decode_fixed_header(buf, avail, &hdr);
         if (rc == 0)
             return 0;
         if (rc < 0) {
@@ -1224,11 +1217,11 @@ int mqtt_process(connection_t *c) {
             return -1;
         }
 
-        if (c->rlen < hdr.total_len)
+        if (avail < hdr.total_len)
             return 0;
 
         // 缓冲区里已经有一条完整报文
-        const uint8_t *body = (const uint8_t *)c->rbuf + hdr.header_len;
+        const uint8_t *body = buf + hdr.header_len;
         size_t body_len = hdr.remaining_length;
 
         printf("fd=%d packet: type=%s(%u), flags=0x%X, remaining_length=%u, "
@@ -1239,6 +1232,10 @@ int mqtt_process(connection_t *c) {
         if (dispatch_packet(c, &hdr, body, body_len) < 0)
             return -1;
 
-        rbuf_consume(c, hdr.total_len);
+        c->rpos += hdr.total_len;
+        if (c->rpos == c->rlen) {
+            c->rpos = 0;
+            c->rlen = 0;
+        }
     }
 }

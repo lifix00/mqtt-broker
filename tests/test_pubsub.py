@@ -96,3 +96,16 @@ def test_binary_payload(broker_port):
     finally:
         sub.disconnect()
         pub.disconnect()
+
+
+def test_large_qos0_burst_keeps_connection(broker_port):
+    """持续大包入站不应把读缓冲撑到上限并断开连接。"""
+    pub = MQTTClient(port=broker_port, client_id="burst-pub", timeout=10)
+    try:
+        pub.connect()
+        payload = b"x" * 1024
+        for _ in range(3000):
+            pub.publish("burst/no-sub", payload, qos=0)
+        pub.ping()
+    finally:
+        pub.disconnect()
