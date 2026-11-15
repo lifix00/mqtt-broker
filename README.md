@@ -7,15 +7,15 @@
 ![C11](https://img.shields.io/badge/C-11-283593?logo=c)
 ![MQTT](https://img.shields.io/badge/MQTT-3.1.1-6a1b9a)
 ![TLS](https://img.shields.io/badge/TLS-1.2+-2e7d32?logo=openssl)
-![Tests](https://img.shields.io/badge/tests-151%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-152%20passed-brightgreen)
 
 ## 亮点
 
 - **协议完整**：QoS 0/1/2、Retained、Will、Keepalive、持久会话、离线队列、inflight 重传、会话过期。
 - **低开销网络层**：单线程 `epoll` 非阻塞事件循环，动态读写缓冲，写缓冲背压，支持 TLS 1.2+。
-- **订阅匹配**：topic trie + 全局边哈希 + 通配符缓存；20k 订阅/2k 消息从 1.8s 降至 0.01s，约 **150×**。
+- **订阅匹配**：topic trie + 全局边哈希 + 通配符缓存；20k 订阅/2k 消息从 1.81s 降至 0.012s，约 **150×**。
 - **异步持久化**：dirty 合并 + 后台 writer + 原子 `rename`；QoS1 持久化吞吐从约 0.7 万提升至 5.3 万 msg/s，约 **7×**。
-- **安全与质量**：用户名认证、topic ACL、151 个集成测试、ASan/UBSan、GitHub Actions CI。
+- **安全与质量**：用户名认证、topic ACL、152 个集成测试、ASan/UBSan、GitHub Actions CI。
 
 ## 快速开始
 
@@ -58,7 +58,7 @@ make
 
 | 场景 | 结果 |
 | --- | --- |
-| 20k 订阅 / 2k 消息匹配 | 约 1.8s → 0.01s（**150×**） |
+| 20k 订阅 / 2k 消息匹配 | 约 1.81s → 0.012s（**150×**） |
 | QoS1 + 持久化 | 约 0.7 万 → 5.3 万 msg/s（**7×**） |
 | QoS1 64B（vs Mosquitto 2.0.21） | 1–100 client，**持平至 +45%** |
 | QoS2 64B（vs Mosquitto 2.0.21） | 1–50 client，0.95–1.09× |
